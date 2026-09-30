@@ -1534,6 +1534,7 @@ def make_uki(opts: UkifyConfig) -> None:
         '.ucode',
         '.splash',
         '.dtb',
+        '.dtbo'
         '.uname',
         '.sbat',
         '.profile',
