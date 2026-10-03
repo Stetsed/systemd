@@ -118,6 +118,9 @@ static void export_stub_variables(EFI_LOADED_IMAGE_PROTOCOL *loaded_image, unsig
                 EFI_STUB_FEATURE_REPORT_STUB_PARTITION |    /* We set StubDevicePartUUID + StubImageIdentifier */
                 EFI_STUB_FEATURE_REPORT_URL |               /* We set StubDeviceURL + LoaderDeviceURL */
                 EFI_STUB_FEATURE_SMBIOS_MEASURED |          /* We measure SMBIOS data into PCR 1 */
+#if HAVE_LIBFDT
+                EFI_STUB_FEATURE_DTBO_ADDONS |              /* We pick up .dtbo addons */
+#endif
                 0;
 
         assert(loaded_image);
@@ -410,6 +413,44 @@ static void install_addon_devicetrees(
         }
 }
 
+static void install_addon_devicetree_overlays(
+                struct devicetree_state *dt_state,
+                const NamedAddon *addons,
+                size_t n_addons,
+                int *parameters_measured) {
+
+        EFI_STATUS err;
+
+        assert(dt_state);
+        assert(addons || n_addons == 0);
+        assert(parameters_measured);
+
+        FOREACH_ARRAY(a, addons, n_addons) {
+                err = devicetree_apply_overlay_memory(dt_state, a->blob.iov_base, a->blob.iov_len);
+                if (err != EFI_SUCCESS) {
+                        log_error_status(err, "Error loading addon devicetree, ignoring: %m");
+                        continue;
+                }
+
+                bool m = false;
+                err = tpm_log_tagged_event(
+                                TPM2_PCR_KERNEL_CONFIG,
+                                POINTER_TO_PHYSICAL_ADDRESS(a->blob.iov_base),
+                                a->blob.iov_len,
+                                DEVICETREE_ADDON_EVENT_TAG_ID,
+                                a->filename,
+                                &m);
+                if (err != EFI_SUCCESS)
+                        return (void) log_error_status(
+                                        err,
+                                        "Unable to extend PCR %i with DTB addon '%ls': %m",
+                                        TPM2_PCR_KERNEL_CONFIG,
+                                        a->filename);
+
+                combine_measured_flag(parameters_measured, m);
+        }
+}
+
 static inline void iovec_array_extend(struct iovec **arr, size_t *n_arr, struct iovec elem) {
         assert(arr);
         assert(n_arr);
@@ -531,6 +572,8 @@ static EFI_STATUS load_addons(
                 char16_t **cmdline,                         /* Both input+output, extended with new addons we find */
                 NamedAddon **devicetree_addons,             /* Ditto */
                 size_t *n_devicetree_addons,
+                NamedAddon **devicetree_overlay_addons,     /* Ditto */
+                size_t *n_devicetree_overlay_addons,
                 NamedAddon **initrd_addons,                 /* Ditto */
                 size_t *n_initrd_addons,
                 NamedAddon **ucode_addons,                  /* Ditto */
@@ -607,9 +650,10 @@ static EFI_STATUS load_addons(
                 if (!PE_SECTION_VECTOR_IS_SET(sections + UNIFIED_SECTION_CMDLINE) &&
                     !PE_SECTION_VECTOR_IS_SET(sections + UNIFIED_SECTION_DTB) &&
                     !PE_SECTION_VECTOR_IS_SET(sections + UNIFIED_SECTION_DTBAUTO) &&
+                    !PE_SECTION_VECTOR_IS_SET(sections + UNIFIED_SECTION_DTBO) &&
                     !PE_SECTION_VECTOR_IS_SET(sections + UNIFIED_SECTION_INITRD) &&
                     !PE_SECTION_VECTOR_IS_SET(sections + UNIFIED_SECTION_UCODE)) {
-                        log_debug("No applicable .cmdline/.dtb/.dtbauto/.initrd/.ucode sections found in %ls, ignoring.",
+                        log_debug("No applicable .cmdline/.dtb/.dtbauto/.initrd/.ucode/.dtbo sections found in %ls, ignoring.",
                                   items[i]);
                         continue;
                 }
@@ -660,6 +704,17 @@ static EFI_STATUS load_addons(
                                 .blob = {
                                         .iov_base = xmemdup((const uint8_t*) loaded_addon->ImageBase + sections[UNIFIED_SECTION_DTB].memory_offset, sections[UNIFIED_SECTION_DTB].memory_size),
                                         .iov_len = sections[UNIFIED_SECTION_DTB].memory_size,
+                                },
+                                .filename = xstrdup16(items[i]),
+                        };
+                }
+                if(devicetree_overlay_addons && PE_SECTION_VECTOR_IS_SET(sections + UNIFIED_SECTION_DTBO)) {
+                        *devicetree_overlay_addons = xrealloc(*devicetree_overlay_addons, *n_devicetree_overlay_addons*sizeof(NamedAddon), (*n_devicetree_overlay_addons + 1)*sizeof(NamedAddon));
+
+                        (*devicetree_overlay_addons)[(*n_devicetree_overlay_addons)++] = (NamedAddon){
+                                .blob = {
+                                        .iov_base = xmemdup((const uint8_t*) loaded_addon->ImageBase + sections[UNIFIED_SECTION_DTBO].memory_offset, sections[UNIFIED_SECTION_DTBO].memory_size),
+                                        .iov_len = sections[UNIFIED_SECTION_DTBO].memory_size,
                                 },
                                 .filename = xstrdup16(items[i]),
                         };
@@ -1023,6 +1078,8 @@ static void load_all_addons(
                 char16_t **cmdline_addons,
                 NamedAddon **dt_addons,
                 size_t *n_dt_addons,
+                NamedAddon **dtbo_addons,
+                size_t *n_dtbo_addons,
                 NamedAddon **initrd_addons,
                 size_t *n_initrd_addons,
                 NamedAddon **ucode_addons,
@@ -1038,6 +1095,8 @@ static void load_all_addons(
         assert(n_initrd_addons);
         assert(ucode_addons);
         assert(n_ucode_addons);
+        assert(dtbo_addons);
+        assert(n_dtbo_addons);
 
         err = load_addons(
                         image,
@@ -1047,6 +1106,8 @@ static void load_all_addons(
                         cmdline_addons,
                         dt_addons,
                         n_dt_addons,
+                        dtbo_addons,
+                        n_dtbo_addons,
                         initrd_addons,
                         n_initrd_addons,
                         ucode_addons,
@@ -1067,6 +1128,8 @@ static void load_all_addons(
                         cmdline_addons,
                         dt_addons,
                         n_dt_addons,
+                        dtbo_addons,
+                        n_dtbo_addons,
                         initrd_addons,
                         n_initrd_addons,
                         ucode_addons,
@@ -1197,8 +1260,8 @@ static EFI_STATUS run(EFI_HANDLE image) {
         PeSectionVector sections[ELEMENTSOF(unified_sections)] = {};
         EFI_LOADED_IMAGE_PROTOCOL *loaded_image;
         _cleanup_free_ char *uname = NULL;
-        NamedAddon *dt_addons = NULL, *initrd_addons = NULL, *ucode_addons = NULL;
-        size_t n_dt_addons = 0, n_initrd_addons = 0, n_ucode_addons = 0;
+        NamedAddon *dt_addons = NULL, *initrd_addons = NULL, *ucode_addons = NULL, *dtbo_addons = NULL;
+        size_t n_dt_addons = 0, n_initrd_addons = 0, n_ucode_addons = 0, n_dtbo_addons = 0;
         _cleanup_free_ struct iovec *all_initrds = NULL;
         size_t n_all_initrds = 0;
         unsigned profile = 0;
@@ -1242,7 +1305,7 @@ static EFI_STATUS run(EFI_HANDLE image) {
         CLEANUP_ARRAY(dt_addons, n_dt_addons, named_addon_free_array);
         CLEANUP_ARRAY(initrd_addons, n_initrd_addons, named_addon_free_array);
         CLEANUP_ARRAY(ucode_addons, n_ucode_addons, named_addon_free_array);
-        load_all_addons(image, loaded_image, uname, &cmdline_addons, &dt_addons, &n_dt_addons, &initrd_addons, &n_initrd_addons, &ucode_addons, &n_ucode_addons);
+        load_all_addons(image, loaded_image, uname, &cmdline_addons, &dt_addons, &n_dt_addons, &dtbo_addons, &n_dtbo_addons, &initrd_addons, &n_initrd_addons, &ucode_addons, &n_ucode_addons);
 
         /* If we have any extra command line to add via PE addons, load them now and append, and measure the
          * additions together, after the embedded options, but before the smbios ones, so that the order is
@@ -1260,9 +1323,13 @@ static EFI_STATUS run(EFI_HANDLE image) {
          * the LoaderPcrSMBIOS EFI variable). */
         measure_smbios();
 
-        /* First load the base device tree, then fix it up using addons - global first, then per-UKI. */
+        /* First load the base device tree, then fix it up using addons - global first, then per-UKI, lastly
+         * install overlays if LIBFDT is installed. */
         install_embedded_devicetree(loaded_image, sections, &dt_state);
         install_addon_devicetrees(&dt_state, dt_addons, n_dt_addons, &parameters_measured);
+        #ifdef HAVE_LIBFDT
+        install_addon_devicetree_overlays(&dt_state, dtbo_addons, n_dtbo_addons, &parameters_measured);
+        #endif
 
         /* Generate & find all initrds */
         acquire_previous_initrd(initrds);
@@ -1306,7 +1373,6 @@ static EFI_STATUS run(EFI_HANDLE image) {
         struct iovec kernel = IOVEC_MAKE(
                         (const uint8_t*) loaded_image->ImageBase + sections[UNIFIED_SECTION_LINUX].memory_offset,
                         sections[UNIFIED_SECTION_LINUX].memory_size);
-
         err = linux_exec(image, cmdline, &kernel, &final_initrd);
         graphics_mode(false);
         return err;

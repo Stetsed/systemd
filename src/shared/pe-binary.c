@@ -312,7 +312,8 @@ bool pe_is_addon(const PeHeader *pe_header, const IMAGE_SECTION_HEADER *sections
                 (pe_header_find_section(pe_header, sections, ".cmdline") ||
                  pe_header_find_section(pe_header, sections, ".dtb") ||
                  pe_header_find_section(pe_header, sections, ".initrd") ||
-                 pe_header_find_section(pe_header, sections, ".ucode"));
+                 pe_header_find_section(pe_header, sections, ".ucode")||
+                 pe_header_find_section(pe_header, sections, ".dtbo"));
 }
 
 bool pe_is_native(const PeHeader *pe_header) {
