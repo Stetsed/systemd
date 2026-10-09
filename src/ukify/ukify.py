@@ -431,7 +431,7 @@ DEFAULT_SECTIONS_TO_SHOW = {
 # Sections that may legitimately appear more than once within a single profile: they carry one entry
 # per hardware variant and the firmware picks the matching one at boot. 'inspect --json' therefore
 # always reports them as a list, and add_section() allows them to repeat.
-MULTI_INSTANCE_SECTIONS = ('.dtbauto', '.efifw')
+MULTI_INSTANCE_SECTIONS = ('.dtbauto', '.efifw', '.dtbo')
 
 
 @dataclasses.dataclass
@@ -1467,7 +1467,7 @@ def make_uki(opts: UkifyConfig) -> None:
         ('.cmdline', opts.cmdline,    True),
         ('.dtb',     opts.devicetree, True),
         *(('.dtbauto', dtb, True) for dtb in opts.devicetree_auto),
-        ('.dtbo', opts.devicetree_overlay, True),
+        *(('.dtbo', dtbo, True) for dtbo in opts.devicetree_overlay),
         ('.hwids',   hwids,           True),
         ('.uname',   opts.uname,      True),
         ('.splash',  opts.splash,     True),
@@ -1533,6 +1533,7 @@ def make_uki(opts: UkifyConfig) -> None:
         '.efifw',
         '.ucode',
         '.splash',
+        '.dtbo',
         '.dtb',
         '.uname',
         '.sbat',
@@ -2116,9 +2117,12 @@ CONFIG_ITEMS = [
     ConfigItem(
         '--devicetree-overlay',
         metavar='PATH',
+        action='append',
         type=Path,
+        default=[],
         help='DeviceTree Overlay File [.dtbo section]',
         config_key='UKI/DeviceTreeOverlay',
+        config_push=ConfigItem.config_list_prepend,
     ),
     ConfigItem(
         '--hwids',
