@@ -433,7 +433,6 @@ EFI_STATUS devicetree_apply_overlay_memory(
                                 "Failed to pack devicetree after overlay: fdt error %d", fdterr);
 
         state->size = fdt_totalsize(base);
-        devicetree_install(state);
         return EFI_SUCCESS;
 #else
         return EFI_UNSUPPORTED;

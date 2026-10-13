@@ -428,9 +428,10 @@ static void install_addon_devicetree_overlays(
         FOREACH_ARRAY(a, addons, n_addons) {
                 err = devicetree_apply_overlay_memory(dt_state, a->blob.iov_base, a->blob.iov_len);
                 if (err != EFI_SUCCESS) {
-                        log_error_status(err, "Error loading addon devicetree, ignoring: %m");
+                        log_error_status(err, "Error loading addon devicetree overlay, ignoring: %m");
                         continue;
                 }
+                devicetree_install(dt_state);
 
                 bool m = false;
                 err = tpm_log_tagged_event(
@@ -443,7 +444,7 @@ static void install_addon_devicetree_overlays(
                 if (err != EFI_SUCCESS)
                         return (void) log_error_status(
                                         err,
-                                        "Unable to extend PCR %i with DTB addon '%ls': %m",
+                                        "Unable to extend PCR %i with DTBO addon '%ls': %m",
                                         TPM2_PCR_KERNEL_CONFIG,
                                         a->filename);
 
@@ -709,7 +710,9 @@ static EFI_STATUS load_addons(
                         };
                 }
                 if(devicetree_overlay_addons && PE_SECTION_VECTOR_IS_SET(sections + UNIFIED_SECTION_DTBO)) {
-                        *devicetree_overlay_addons = xrealloc(*devicetree_overlay_addons, *n_devicetree_overlay_addons*sizeof(NamedAddon), (*n_devicetree_overlay_addons + 1)*sizeof(NamedAddon));
+                        *devicetree_overlay_addons = xrealloc(*devicetree_overlay_addons,
+                                                              *n_devicetree_overlay_addons*sizeof(NamedAddon),
+                                                              (*n_devicetree_overlay_addons + 1)*sizeof(NamedAddon));
 
                         (*devicetree_overlay_addons)[(*n_devicetree_overlay_addons)++] = (NamedAddon){
                                 .blob = {
@@ -1069,6 +1072,20 @@ static void install_embedded_devicetree(
                         sections[section].memory_size);
         if (err != EFI_SUCCESS)
                 log_error_status(err, "Error loading embedded devicetree, ignoring: %m");
+
+        #ifdef HAVE_LIBFDT
+        if (!PE_SECTION_VECTOR_IS_SET(sections + UNIFIED_SECTION_DTBO))
+                return;
+
+        err = devicetree_apply_overlay_memory(dt_state,
+                                              (uint8_t*) loaded_image->ImageBase + sections[UNIFIED_SECTION_DTBO].memory_offset,
+                                              sections[section].memory_size);
+
+        if (err != EFI_SUCCESS)
+                log_error_status(err, "Error loaded embedded devicetree overlay, ignoring: %m");
+
+        devicetree_install(dt_state);
+        #endif
 }
 
 static void load_all_addons(
@@ -1324,7 +1341,7 @@ static EFI_STATUS run(EFI_HANDLE image) {
         measure_smbios();
 
         /* First load the base device tree, then fix it up using addons - global first, then per-UKI, lastly
-         * install overlays if LIBFDT is installed. */
+         * install overlays from addons if compiled with LIBFDT. */
         install_embedded_devicetree(loaded_image, sections, &dt_state);
         install_addon_devicetrees(&dt_state, dt_addons, n_dt_addons, &parameters_measured);
         #ifdef HAVE_LIBFDT
