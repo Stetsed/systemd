@@ -276,6 +276,7 @@ class UkifyConfig:
     cmdline: Union[str, Path, None]
     devicetree: Path
     devicetree_auto: list[Path]
+    devicetree_overlay: Path
     efi_arch: str
     hwids: Union[str, Path, None]
     initrd: list[Path]
@@ -414,6 +415,7 @@ DEFAULT_SECTIONS_TO_SHOW = {
     '.splash':  'binary',
     '.dtb':     'binary',
     '.dtbauto': 'binary',
+    '.dtbo':     'binary',
     '.hwids':   'binary',
     '.efifw':   'binary',
     '.cmdline': 'text',
@@ -1465,6 +1467,7 @@ def make_uki(opts: UkifyConfig) -> None:
         ('.cmdline', opts.cmdline,    True),
         ('.dtb',     opts.devicetree, True),
         *(('.dtbauto', dtb, True) for dtb in opts.devicetree_auto),
+        ('.dtbo', opts.devicetree_overlay, True),
         ('.hwids',   hwids,           True),
         ('.uname',   opts.uname,      True),
         ('.splash',  opts.splash,     True),
@@ -2109,6 +2112,13 @@ CONFIG_ITEMS = [
         default=[],
         config_key='UKI/DeviceTreeAuto',
         config_push=ConfigItem.config_list_prepend,
+    ),
+    ConfigItem(
+        '--devicetree-overlay',
+        metavar='PATH',
+        type=Path,
+        help='DeviceTree Overlay File [.dtbo section]',
+        config_key='UKI/DeviceTreeOverlay',
     ),
     ConfigItem(
         '--hwids',
