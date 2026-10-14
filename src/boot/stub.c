@@ -1092,9 +1092,10 @@ static void install_embedded_devicetree_overlay(
                                               (uint8_t*) loaded_image->ImageBase + sections[UNIFIED_SECTION_DTBO].memory_offset,
                                               sections[UNIFIED_SECTION_DTBO].memory_size);
 
-        if (err != EFI_SUCCESS)
+        if (err != EFI_SUCCESS){
                 log_warning_status(err, "Error loading embedded devicetree overlay, ignoring: %m");
                 return;
+        }
 
         err = devicetree_install(dt_state);
 
@@ -1354,8 +1355,7 @@ static EFI_STATUS run(EFI_HANDLE image) {
          * the LoaderPcrSMBIOS EFI variable). */
         measure_smbios();
 
-        /* First load the base device tree, then fix it up using addons - global first, then per-UKI, lastly
-         * install overlays from addons if compiled with LIBFDT. */
+        /* First load the base device tree and overlay, then fix it up using addons - global first, then per-UKI */
         install_embedded_devicetree(loaded_image, sections, &dt_state);
         install_embedded_devicetree_overlay(loaded_image, sections, &dt_state);
         install_addon_devicetrees(&dt_state, dt_addons, n_dt_addons, &parameters_measured);
