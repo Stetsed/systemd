@@ -28,6 +28,7 @@ systemctl_sources = files(
         'systemctl-start-special.c',
         'systemctl-switch-root.c',
         'systemctl-trivial-method.c',
+        'systemctl-wait.c',
         'systemctl-whoami.c',
 )
 systemctl_export_sources = files(
@@ -53,6 +54,12 @@ executables += [
                 ],
                 'install' : get_option('link-systemctl-shared') ? 'yes' : 'static',
                 'install_tag' : 'systemctl',
+                'symlinks' : [
+                        { 'name' : 'halt',     'install_dir' : sbindir },
+                        { 'name' : 'poweroff', 'install_dir' : sbindir },
+                        { 'name' : 'reboot',   'install_dir' : sbindir },
+                        { 'name' : 'shutdown', 'install_dir' : sbindir },
+                ],
         },
         fuzz_template + {
                 'sources' : files('fuzz-systemctl-parse-argv.c'),
@@ -62,9 +69,3 @@ executables += [
                 ],
         },
 ]
-
-foreach alias : ['halt', 'poweroff', 'reboot', 'shutdown']
-        install_symlink(alias,
-                        pointing_to : sbin_to_bin + 'systemctl',
-                        install_dir : sbindir)
-endforeach

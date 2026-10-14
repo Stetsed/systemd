@@ -61,7 +61,7 @@ int bus_image_common_get_os_release(
                 return 1;
 
         if (!image->metadata_valid) {
-                r = image_read_metadata(image, /* root= */ NULL, &image_policy_service, m->runtime_scope);
+                r = image_read_metadata(image, /* root= */ NULL, &image_policy_service, m->runtime_scope, /* extra_flags= */ 0);
                 if (r < 0)
                         return sd_bus_error_set_errnof(error, r, "Failed to read image metadata: %m");
         }
@@ -713,6 +713,11 @@ int bus_image_common_reattach(
                 return r;
         if (r == 0) /* Will call us back */
                 return 1;
+
+        /* portable_attach() checks this too, but by then the image is detached already. */
+        r = portable_profile_validate(m->runtime_scope, profile, error);
+        if (r < 0)
+                return r;
 
         r = portable_detach(
                         m->runtime_scope,

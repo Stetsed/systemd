@@ -21,6 +21,7 @@
 #include "fs-util.h"
 #include "hashmap.h"
 #include "id128-util.h"
+#include "io-util.h"
 #include "journal-authenticate-internal.h"
 #include "journal-def.h"
 #include "journal-file.h"
@@ -392,7 +393,6 @@ static int journal_file_init_header(
                 JournalFileFlags file_flags,
                 JournalFile *template) {
 
-        ssize_t k;
         int r;
 
         assert(f);
@@ -429,13 +429,7 @@ static int journal_file_init_header(
         } else
                 h.seqnum_id = h.file_id;
 
-        k = pwrite(f->fd, &h, sizeof(h), 0);
-        if (k < 0)
-                return -errno;
-        if (k != sizeof(h))
-                return -EIO;
-
-        return 0;
+        return pwrite_full(f->fd, &h, sizeof(h), 0);
 }
 
 static int journal_file_refresh_header(JournalFile *f) {
@@ -848,14 +842,16 @@ static int journal_file_allocate(JournalFile *f, uint64_t offset, uint64_t size)
         return journal_file_fstat(f);
 }
 
-static int journal_file_move_to(
+static int journal_file_move_to_full(
                 JournalFile *f,
                 ObjectType type,
                 bool keep_always,
                 uint64_t offset,
                 uint64_t size,
-                void **ret) {
+                void **ret,
+                uint64_t *ret_size) {
 
+        size_t window_size;
         int r;
 
         assert(f);
@@ -884,7 +880,27 @@ static int journal_file_move_to(
                         return -EADDRNOTAVAIL;
         }
 
-        return mmap_cache_fd_get(f->cache_fd, type_to_category(type), keep_always, offset, size, &f->last_stat, ret);
+        r = mmap_cache_fd_get(f->cache_fd, type_to_category(type), keep_always, offset, size, &f->last_stat, ret, &window_size);
+        if (r < 0)
+                return r;
+
+        /* The window is rounded up to whole pages, and may extend beyond the end of the file, which must not
+         * be accessed */
+        if (ret_size)
+                *ret_size = MIN((uint64_t) window_size, (uint64_t) f->last_stat.st_size - offset);
+
+        return 0;
+}
+
+static int journal_file_move_to(
+                JournalFile *f,
+                ObjectType type,
+                bool keep_always,
+                uint64_t offset,
+                uint64_t size,
+                void **ret) {
+
+        return journal_file_move_to_full(f, type, keep_always, offset, size, ret, /* ret_size= */ NULL);
 }
 
 static uint64_t minimum_header_size(JournalFile *f, Object *o) {
@@ -985,6 +1001,21 @@ static int check_object(JournalFile *f, Object *o, uint64_t offset) {
                                                le64toh(o->data.entry_array_offset),
                                                offset);
 
+                /* Objects are only ever appended, hence a hash chain has to move strictly forward. */
+                if (le64toh(o->data.next_hash_offset) > 0 && le64toh(o->data.next_hash_offset) <= offset)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                               "Invalid data object next_hash_offset: %" PRIu64 ": %" PRIu64,
+                                               le64toh(o->data.next_hash_offset),
+                                               offset);
+
+                /* New data objects are prepended to the list of their field, hence that list has to move
+                 * strictly backward. */
+                if (le64toh(o->data.next_field_offset) >= offset)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                               "Invalid data object next_field_offset: %" PRIu64 ": %" PRIu64,
+                                               le64toh(o->data.next_field_offset),
+                                               offset);
+
                 break;
 
         case OBJECT_FIELD:
@@ -1001,6 +1032,12 @@ static int check_object(JournalFile *f, Object *o, uint64_t offset) {
                                                "Invalid offset, next_hash_offset=" OFSfmt ", head_data_offset=" OFSfmt ": %" PRIu64,
                                                le64toh(o->field.next_hash_offset),
                                                le64toh(o->field.head_data_offset),
+                                               offset);
+
+                if (le64toh(o->field.next_hash_offset) > 0 && le64toh(o->field.next_hash_offset) <= offset)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                               "Invalid field object next_hash_offset: %" PRIu64 ": %" PRIu64,
+                                               le64toh(o->field.next_hash_offset),
                                                offset);
                 break;
 
@@ -1106,8 +1143,9 @@ static int check_object(JournalFile *f, Object *o, uint64_t offset) {
 }
 
 int journal_file_move_to_object(JournalFile *f, ObjectType type, uint64_t offset, Object **ret) {
-        int r;
+        uint64_t size, available;
         Object *o;
+        int r;
 
         assert(f);
 
@@ -1129,7 +1167,7 @@ int journal_file_move_to_object(JournalFile *f, ObjectType type, uint64_t offset
                                        journal_object_type_to_string(type),
                                        offset);
 
-        r = journal_file_move_to(f, type, false, offset, offsetof(ObjectHeader, payload), (void**) &o);
+        r = journal_file_move_to_full(f, type, false, offset, offsetof(ObjectHeader, payload), (void**) &o, &available);
         if (r < 0)
                 return r;
 
@@ -1137,13 +1175,17 @@ int journal_file_move_to_object(JournalFile *f, ObjectType type, uint64_t offset
         if (r < 0)
                 return r;
 
-        r = journal_file_move_to(f, type, false, offset, le64toh(READ_NOW(o->object.size)), (void**) &o);
-        if (r < 0)
-                return r;
+        /* Usually the window of the header contains the whole object, which then needs no second lookup */
+        size = le64toh(READ_NOW(o->object.size));
+        if (size > available) {
+                r = journal_file_move_to(f, type, false, offset, size, (void**) &o);
+                if (r < 0)
+                        return r;
 
-        r = check_object_header(f, o, type, offset);
-        if (r < 0)
-                return r;
+                r = check_object_header(f, o, type, offset);
+                if (r < 0)
+                        return r;
+        }
 
         r = check_object(f, o, offset);
         if (r < 0)
@@ -1298,7 +1340,6 @@ int journal_file_append_object(
 
 static int journal_file_setup_data_hash_table(JournalFile *f) {
         uint64_t s, p;
-        Object *o;
         int r;
 
         assert(f);
@@ -1314,14 +1355,20 @@ static int journal_file_setup_data_hash_table(JournalFile *f) {
 
         log_debug("Reserving %"PRIu64" entries in data hash table.", s);
 
+        /* We deliberately don't zero the hash table items: the table is placed in a newly created file, in
+         * space that was just allocated via posix_fallocate() and hence reads as zeroes anyway. Writing the
+         * zeroes through the memory map would not only write out the whole table once for no reason: the
+         * sequential write faults would also make the kernel's mmap readahead instantiate most of the table
+         * in large folios, on file systems that support them. And since write faults on shared file mappings
+         * dirty the whole folio, each later update of a single hash bucket would then cause the whole folio
+         * to be written back. See #40262. */
+
         r = journal_file_append_object(f,
                                        OBJECT_DATA_HASH_TABLE,
                                        offsetof(Object, hash_table.items) + s * sizeof(HashItem),
-                                       &o, &p);
+                                       /* ret_object= */ NULL, &p);
         if (r < 0)
                 return r;
-
-        memzero(o->hash_table.items, s * sizeof(HashItem));
 
         f->header->data_hash_table_offset = htole64(p + offsetof(Object, hash_table.items));
         f->header->data_hash_table_size = htole64(s * sizeof(HashItem));
@@ -1331,7 +1378,6 @@ static int journal_file_setup_data_hash_table(JournalFile *f) {
 
 static int journal_file_setup_field_hash_table(JournalFile *f) {
         uint64_t s, p;
-        Object *o;
         int r;
 
         assert(f);
@@ -1343,14 +1389,13 @@ static int journal_file_setup_field_hash_table(JournalFile *f) {
         s = DEFAULT_FIELD_HASH_TABLE_SIZE;
         log_debug("Reserving %"PRIu64" entries in field hash table.", s);
 
+        /* No need to zero the items, see journal_file_setup_data_hash_table(). */
         r = journal_file_append_object(f,
                                        OBJECT_FIELD_HASH_TABLE,
                                        offsetof(Object, hash_table.items) + s * sizeof(HashItem),
-                                       &o, &p);
+                                       /* ret_object= */ NULL, &p);
         if (r < 0)
                 return r;
-
-        memzero(o->hash_table.items, s * sizeof(HashItem));
 
         f->header->field_hash_table_offset = htole64(p + offsetof(Object, hash_table.items));
         f->header->field_hash_table_size = htole64(s * sizeof(HashItem));
@@ -1549,7 +1594,7 @@ static bool chain_tail_lost(JournalFile *f, int r, uint64_t offset, ObjectType t
         return true;
 }
 
-int journal_file_find_field_object_with_hash(
+static int journal_file_find_field_object_with_hash(
                 JournalFile *f,
                 const void *field,
                 uint64_t size,
@@ -1652,7 +1697,7 @@ int journal_file_find_field_object(
                         ret_object, ret_offset);
 }
 
-int journal_file_find_data_object_with_hash(
+static int journal_file_find_data_object_with_hash(
                 JournalFile *f,
                 const void *data,
                 uint64_t size,
@@ -2069,6 +2114,32 @@ int journal_file_data_payload(
                                         field_length, data_threshold, ret_data, ret_size);
 }
 
+int journal_file_data_payload_pinned(
+                JournalFile *f,
+                uint64_t offset,
+                const char *field,
+                size_t field_length,
+                size_t data_threshold,
+                const void **ret_data,
+                size_t *ret_size) {
+
+        Object *o;
+        int r;
+
+        /* Callers look up the payload in other files afterwards. Data objects of all files share one window
+         * per category, hence pin the window, so that the payload stays mapped. */
+
+        r = journal_file_move_to_object(f, OBJECT_DATA, offset, &o);
+        if (r < 0)
+                return r;
+
+        r = journal_file_pin_object(f, o);
+        if (r < 0)
+                return r;
+
+        return journal_file_data_payload(f, o, offset, field, field_length, data_threshold, ret_data, ret_size);
+}
+
 uint64_t journal_file_entry_n_items(JournalFile *f, Object *o) {
         uint64_t sz;
 
@@ -2083,6 +2154,50 @@ uint64_t journal_file_entry_n_items(JournalFile *f, Object *o) {
                 return 0;
 
         return (sz - offsetof(Object, entry.items)) / journal_file_entry_item_size(f);
+}
+
+int journal_file_entry_n_fields(JournalFile *f, Object *o, uint64_t offset, uint64_t *ret) {
+        assert(f);
+        assert(o);
+        assert(ret);
+
+        if (o->object.type != OBJECT_ENTRY)
+                return -EBADMSG;
+
+        *ret = journal_file_entry_n_items(f, o);
+        return 0;
+}
+
+int journal_file_entry_field_payload(
+                JournalFile *f,
+                Object *o,
+                uint64_t offset,
+                uint64_t i,
+                const char *field,
+                size_t field_length,
+                size_t data_threshold,
+                const void **ret_data,
+                size_t *ret_size) {
+
+        uint64_t n;
+        int r;
+
+        assert(f);
+        assert(o);
+
+        r = journal_file_entry_n_fields(f, o, offset, &n);
+        if (r < 0)
+                return r;
+        if (i >= n)
+                return -EADDRNOTAVAIL;
+
+        return journal_file_data_payload(
+                        f,
+                        /* o= */ NULL,
+                        journal_file_entry_item_object_offset(f, o, i),
+                        field, field_length,
+                        data_threshold,
+                        ret_data, ret_size);
 }
 
 uint64_t journal_file_entry_array_n_items(JournalFile *f, Object *o) {
@@ -3729,7 +3844,7 @@ int journal_file_move_to_entry_by_offset_for_data(
                         ret, ret_offset);
 }
 
-int journal_file_move_to_entry_by_monotonic_for_data(
+static int journal_file_move_to_entry_by_monotonic_for_data(
                 JournalFile *f,
                 Object *d,
                 sd_id128_t boot_id,
@@ -3825,7 +3940,7 @@ int journal_file_move_to_entry_by_seqnum_for_data(
                         ret_object, ret_offset);
 }
 
-int journal_file_move_to_entry_by_realtime_for_data(
+static int journal_file_move_to_entry_by_realtime_for_data(
                 JournalFile *f,
                 Object *d,
                 uint64_t realtime,
@@ -3845,6 +3960,43 @@ int journal_file_move_to_entry_by_realtime_for_data(
                         test_object_realtime,
                         direction,
                         ret, ret_offset);
+}
+
+int journal_file_seek_for_match(
+                JournalFile *f,
+                const void *data,
+                uint64_t size,
+                JournalSeek where,
+                sd_id128_t boot_id,
+                uint64_t needle,
+                direction_t direction,
+                Object **ret_object,
+                uint64_t *ret_offset) {
+
+        Object *d;
+        int r;
+
+        assert(f);
+        assert(data || size == 0);
+
+        r = journal_file_find_data_object(f, data, size, &d, NULL);
+        if (r <= 0)
+                return r;
+
+        switch (where) {
+        case JOURNAL_SEEK_FIRST:
+                return journal_file_move_to_entry_for_data(f, d, direction, ret_object, ret_offset);
+        case JOURNAL_SEEK_OFFSET:
+                return journal_file_move_to_entry_by_offset_for_data(f, d, needle, direction, ret_object, ret_offset);
+        case JOURNAL_SEEK_SEQNUM:
+                return journal_file_move_to_entry_by_seqnum_for_data(f, d, needle, direction, ret_object, ret_offset);
+        case JOURNAL_SEEK_REALTIME:
+                return journal_file_move_to_entry_by_realtime_for_data(f, d, needle, direction, ret_object, ret_offset);
+        case JOURNAL_SEEK_MONOTONIC:
+                return journal_file_move_to_entry_by_monotonic_for_data(f, d, boot_id, needle, direction, ret_object, ret_offset);
+        default:
+                assert_not_reached();
+        }
 }
 
 void journal_file_dump(JournalFile *f) {
@@ -4246,7 +4398,7 @@ int journal_file_open(
                 goto fail;
         }
 
-        r = mmap_cache_fd_get(f->cache_fd, MMAP_CACHE_CATEGORY_HEADER, true, 0, PAGE_ALIGN(sizeof(Header)), &f->last_stat, &h);
+        r = mmap_cache_fd_get(f->cache_fd, MMAP_CACHE_CATEGORY_HEADER, true, 0, PAGE_ALIGN(sizeof(Header)), &f->last_stat, &h, /* ret_size= */ NULL);
         if (r == -EINVAL) {
                 /* Some file systems (jffs2 or p9fs) don't support mmap() properly (or only read-only
                  * mmap()), and return EINVAL in that case. Let's propagate that as a more recognizable error
@@ -4485,7 +4637,9 @@ int journal_file_copy_entry(
         };
         boot_id = o->entry.boot_id;
 
-        n = journal_file_entry_n_items(from, o);
+        r = journal_file_entry_n_fields(from, o, p, &n);
+        if (r < 0)
+                return r;
         if (n == 0)
                 return 0;
 
@@ -4500,13 +4654,16 @@ int journal_file_copy_entry(
         }
 
         for (uint64_t i = 0; i < n; i++) {
-                uint64_t h, q;
+                uint64_t h;
                 const void *data;
                 size_t l;
                 Object *u;
 
-                q = journal_file_entry_item_object_offset(from, o, i);
-                r = journal_file_data_payload(from, NULL, q, NULL, 0, 0, &data, &l);
+                r = journal_file_entry_field_payload(
+                                from, o, p, i,
+                                /* field= */ NULL, /* field_length= */ 0,
+                                /* data_threshold= */ 0,
+                                &data, &l);
                 if (IN_SET(r, -EADDRNOTAVAIL, -EBADMSG)) {
                         log_debug_errno(r, "Entry item %"PRIu64" data object is bad, skipping over it: %m", i);
                         continue;

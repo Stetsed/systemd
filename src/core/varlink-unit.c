@@ -20,9 +20,12 @@
 #include "json-util.h"
 #include "locale-util.h"
 #include "manager.h"
+#include "namespace.h"
+#include "parse-util.h"
 #include "path-util.h"
 #include "pidref.h"
 #include "process-util.h"
+#include "scope.h"
 #include "selinux-access.h"
 #include "service.h"
 #include "set.h"
@@ -344,7 +347,7 @@ static int unit_runtime_build_json(sd_json_variant **ret, const char *name, void
                         SD_JSON_BUILD_PAIR_BOOLEAN("AssertResult", u->assert_result),
                         JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("ConditionTimestamp", &u->condition_timestamp),
                         JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("AssertTimestamp", &u->assert_timestamp),
-                        SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(u->invocation_id), "InvocationID", SD_JSON_BUILD_UUID(u->invocation_id)),
+                        SD_JSON_BUILD_PAIR_CONDITION(unit_has_invocation_id(u), "InvocationID", SD_JSON_BUILD_UUID(u->invocation_id)),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("Markers", markers_build_json, &u->markers),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("ActivationDetails", activation_details_build_json, u->activation_details),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("CGroup", unit_cgroup_runtime_build_json, u),
@@ -649,8 +652,13 @@ void varlink_job_send_removed_signal(Job *j) {
                         SD_JSON_BUILD_PAIR_CALLBACK("runtime", unit_runtime_build_json, j->unit),
                         SD_JSON_BUILD_PAIR_CALLBACK("job", job_build_json, j));
 
+        /* Only drop the unit change subscription if it belongs to this very method call. A unit can carry
+         * two jobs at the same time (the regular one and a NOP one), which may be watched by two different
+         * connections, and the one finishing here must not tear down the other one's subscription. */
+        if (j->unit->varlink_unit_change == j->varlink)
+                j->unit->varlink_unit_change = sd_varlink_unref(j->unit->varlink_unit_change);
+
         j->varlink = sd_varlink_unref(j->varlink);
-        j->unit->varlink_unit_change = sd_varlink_unref(j->unit->varlink_unit_change);
 }
 
 typedef struct TransientExecCommandItem {
@@ -694,6 +702,8 @@ static ExecOutput exec_output_from_string_harder(const char *s) {
 
 static JSON_DISPATCH_ENUM_DEFINE(dispatch_exec_output, ExecOutput, exec_output_from_string_harder);
 static JSON_DISPATCH_ENUM_DEFINE(dispatch_kill_mode, KillMode, kill_mode_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_job_type, JobType, job_type_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_oom_policy, OOMPolicy, oom_policy_from_string);
 
 typedef struct TransientWorkingDirectory {
         const char *path;
@@ -755,6 +765,14 @@ typedef struct TransientExecContextParameters {
         ExecInput std_input;
         ExecOutput std_output;
         ExecOutput std_error;
+        /* PrivateNetwork is a tristate bool too, but arrives as a yes/no string: the runtime
+         * context emits it via JSON_BUILD_PAIR_YES_NO and the IDL types it as string. */
+        int private_network;
+        /* Int-backed enums: -1 = absent (seeded like the tristates), parsed values >= 0. */
+        ProtectSystem protect_system;
+        ProtectHome protect_home;
+        PrivateTmp private_tmp;
+        PrivateUsers private_users;
 } TransientExecContextParameters;
 
 static void transient_set_credential_array_free(TransientSetCredential *items, size_t n) {
@@ -825,6 +843,33 @@ static void transient_service_parameters_init(TransientServiceParameters *p) {
         };
 }
 
+typedef struct TransientUSec {
+        usec_t value;
+        bool present;
+} TransientUSec;
+
+typedef struct TransientScopeParameters {
+        bool present;
+        OOMPolicy oom_policy;
+        TransientUSec runtime_max_usec;
+        TransientUSec runtime_rand_extra_usec;
+        TransientUSec timeout_stop_usec;
+        sd_json_variant *pids;
+} TransientScopeParameters;
+
+static void transient_scope_parameters_done(TransientScopeParameters *p) {
+        assert(p);
+
+        p->pids = sd_json_variant_unref(p->pids);
+}
+
+static void transient_scope_parameters_init(TransientScopeParameters *p) {
+        assert(p);
+        *p = (TransientScopeParameters) {
+                .oom_policy = _OOM_POLICY_INVALID,
+        };
+}
+
 static int dispatch_transient_exec_command(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
         static const sd_json_dispatch_field exec_command_dispatch[] = {
                 { "path",          SD_JSON_VARIANT_STRING,  sd_json_dispatch_const_string, offsetof(TransientExecCommandItem, path),           SD_JSON_MANDATORY },
@@ -867,18 +912,28 @@ typedef struct StartTransientContextParameters {
         const char *id;
         const char *description;
         CollectMode collect_mode;
+        char **dependencies[_UNIT_DEPENDENCY_MAX];
         TransientExecContextParameters exec;
         TransientKillContextParameters kill;
         TransientServiceParameters service;
+        TransientScopeParameters scope;
+        TransientCGroupContextParameters cgroup;
         const char *bad_exec_field;    /* Set by inner Exec dispatcher to the unknown sub-property name */
         const char *bad_kill_field;
         const char *bad_service_field;
+        const char *bad_scope_field;
+        const char *bad_cgroup_field;
 } StartTransientContextParameters;
 
 static void start_transient_context_parameters_done(StartTransientContextParameters *p) {
         assert(p);
+
+        FOREACH_ELEMENT(d, p->dependencies)
+                strv_free(*d);
+
         transient_exec_context_parameters_done(&p->exec);
         transient_service_parameters_done(&p->service);
+        transient_scope_parameters_done(&p->scope);
 }
 
 static void transient_exec_context_parameters_init(TransientExecContextParameters *p);
@@ -891,6 +946,8 @@ static void start_transient_context_parameters_init(StartTransientContextParamet
         transient_exec_context_parameters_init(&p->exec);
         transient_kill_context_parameters_init(&p->kill);
         transient_service_parameters_init(&p->service);
+        transient_scope_parameters_init(&p->scope);
+        transient_cgroup_context_parameters_init(&p->cgroup);
 }
 
 typedef struct StartTransientParameters {
@@ -1044,16 +1101,94 @@ static int dispatch_transient_service(const char *name, sd_json_variant *variant
         return sd_json_dispatch_full(variant, service_dispatch, /* bad= */ NULL, /* flags= */ 0, &p->service, &p->bad_service_field);
 }
 
+static int dispatch_transient_usec(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        TransientUSec *t = ASSERT_PTR(userdata);
+        int r;
+
+        if (sd_json_variant_is_null(variant)) {
+                t->present = false;
+                return 0;
+        }
+
+        r = sd_json_dispatch_uint64(name, variant, flags, &t->value);
+        if (r < 0)
+                return r;
+
+        t->present = true;
+        return 0;
+}
+
+static int dispatch_transient_scope(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field scope_dispatch[] = {
+                { "OOMPolicy",                  SD_JSON_VARIANT_STRING,        dispatch_oom_policy,      offsetof(TransientScopeParameters, oom_policy),              0 },
+                { "RuntimeMaxUSec",             _SD_JSON_VARIANT_TYPE_INVALID, dispatch_transient_usec,  offsetof(TransientScopeParameters, runtime_max_usec),        0 },
+                { "RuntimeRandomizedExtraUSec", _SD_JSON_VARIANT_TYPE_INVALID, dispatch_transient_usec,  offsetof(TransientScopeParameters, runtime_rand_extra_usec), 0 },
+                { "TimeoutStopUSec",            _SD_JSON_VARIANT_TYPE_INVALID, dispatch_transient_usec,  offsetof(TransientScopeParameters, timeout_stop_usec),       0 },
+                { "PIDs",                       SD_JSON_VARIANT_ARRAY,         sd_json_dispatch_variant, offsetof(TransientScopeParameters, pids),                    0 },
+                {}
+        };
+
+        StartTransientContextParameters *p = ASSERT_PTR(userdata);
+        p->scope.present = true;
+        return sd_json_dispatch_full(variant, scope_dispatch, /* bad= */ NULL, /* flags= */ 0, &p->scope, &p->bad_scope_field);
+}
+
+static int dispatch_transient_cgroup(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        StartTransientContextParameters *p = ASSERT_PTR(userdata);
+        p->cgroup.present = true;
+        return transient_cgroup_context_dispatch(variant, &p->cgroup, &p->bad_cgroup_field);
+}
+
+static int dispatch_dependency(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        char ***dest = ASSERT_PTR(userdata);
+        _cleanup_strv_free_ char **units = NULL;
+        int r;
+
+        r = sd_json_dispatch_strv(name, variant, /* flags= */ 0, &units);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(unit, units)
+                if (!unit_name_is_valid(*unit, UNIT_NAME_PLAIN|UNIT_NAME_INSTANCE))
+                        return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a valid unit name.", strna(name));
+
+        strv_free_and_replace(*dest, units);
+        return 0;
+}
+
 static int dispatch_transient_context(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
-        static const sd_json_dispatch_field context_dispatch[] = {
+        static const sd_json_dispatch_field base_context_dispatch[] = {
                 { "ID",          SD_JSON_VARIANT_STRING, json_dispatch_const_unit_name,   offsetof(StartTransientContextParameters, id),           SD_JSON_MANDATORY },
                 { "Description", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,   offsetof(StartTransientContextParameters, description),  0                 },
                 { "CollectMode", SD_JSON_VARIANT_STRING, dispatch_collect_mode,           offsetof(StartTransientContextParameters, collect_mode), 0                 },
                 { "Exec",        SD_JSON_VARIANT_OBJECT, dispatch_transient_exec_context, 0,                                                       0                 },
                 { "Kill",        SD_JSON_VARIANT_OBJECT, dispatch_transient_kill,         0,                                                       0                 },
                 { "Service",     SD_JSON_VARIANT_OBJECT, dispatch_transient_service,      0,                                                       0                 },
-                {}
+                { "Scope",       SD_JSON_VARIANT_OBJECT, dispatch_transient_scope,        0,                                                       0                 },
+                { "CGroup",      SD_JSON_VARIANT_OBJECT, dispatch_transient_cgroup,       0,                                                       0                 },
         };
+        /* Build dispatch table only once, it's constant. */
+        static sd_json_dispatch_field context_dispatch[ELEMENTSOF(base_context_dispatch) + _UNIT_DEPENDENCY_MAX + 1] = {};
+        static bool context_dispatch_set = false;
+
+        if (!context_dispatch_set) {
+                size_t i = 0;
+
+                FOREACH_ELEMENT(field, base_context_dispatch)
+                        context_dispatch[i++] = *field;
+
+                for (UnitDependency dep = 0; dep < _UNIT_DEPENDENCY_MAX; dep++) {
+                        if (!unit_dependency_can_be_transient(dep))
+                                continue;
+                        context_dispatch[i++] = (sd_json_dispatch_field) {
+                                .name = unit_dependency_to_string(dep),
+                                .type = SD_JSON_VARIANT_ARRAY,
+                                .callback = dispatch_dependency,
+                                .offset = offsetof(StartTransientContextParameters, dependencies[dep]),
+                        };
+                }
+                context_dispatch_set = true;
+        }
 
         StartTransientParameters *p = ASSERT_PTR(userdata);
         const char *bad_field = NULL;
@@ -1073,6 +1208,10 @@ static int dispatch_transient_context(const char *name, sd_json_variant *variant
                         p->unsupported_property = strjoin("Kill.", p->context.bad_kill_field);
                 else if (streq(bad_field, "Service") && !isempty(p->context.bad_service_field))
                         p->unsupported_property = strjoin("Service.", p->context.bad_service_field);
+                else if (streq(bad_field, "Scope") && !isempty(p->context.bad_scope_field))
+                        p->unsupported_property = strjoin("Scope.", p->context.bad_scope_field);
+                else if (streq(bad_field, "CGroup") && !isempty(p->context.bad_cgroup_field))
+                        p->unsupported_property = strjoin("CGroup.", p->context.bad_cgroup_field);
                 else
                         p->unsupported_property = strdup(bad_field);
                 if (!p->unsupported_property)
@@ -1081,7 +1220,24 @@ static int dispatch_transient_context(const char *name, sd_json_variant *variant
         return r;
 }
 
-static int transient_unit_apply_properties(Unit *u, StartTransientContextParameters *p) {
+static void transient_unit_apply_usec(Unit *u, const char *name, usec_t *p, UnitWriteFlags flags, TransientUSec *v) {
+        assert(u);
+        assert(name);
+        assert(p);
+        assert(v);
+
+        if (!v->present)
+                return;
+
+        *p = v->value;
+
+        const char *e = ASSERT_PTR(endswith(name, "USec"));
+        char *n = strndupa_safe(name, e - name);
+        const char *f = FORMAT_TIMESPAN(v->value, USEC_PER_MSEC);
+        unit_write_settingf(u, UNIT_RUNTIME|flags, name, "%sSec=%s", n, f);
+}
+
+static int transient_unit_apply_properties(Unit *u, StartTransientContextParameters *p, const char **reterr_field) {
         int r;
 
         assert(u);
@@ -1097,6 +1253,26 @@ static int transient_unit_apply_properties(Unit *u, StartTransientContextParamet
         if (p->collect_mode >= 0) {
                 u->collect_mode = p->collect_mode;
                 unit_write_settingf(u, UNIT_RUNTIME, "CollectMode", "CollectMode=%s", collect_mode_to_string(p->collect_mode));
+        }
+
+        for (UnitDependency dep_type = 0; dep_type < _UNIT_DEPENDENCY_MAX; dep_type++) {
+                if (!unit_dependency_can_be_transient(dep_type))
+                        continue;
+
+                const char *dep_type_name = unit_dependency_to_string(dep_type);
+                STRV_FOREACH(dep, p->dependencies[dep_type]) {
+                        r = unit_add_dependency_by_name(u, dep_type, *dep, true, UNIT_DEPENDENCY_FILE);
+                        if (r < 0) {
+                                if (reterr_field)
+                                        *reterr_field = dep_type_name;
+                                return r;
+                        }
+
+                        _cleanup_free_ char *label = strjoin(dep_type_name, "-", *dep);
+                        if (!label)
+                                return -ENOMEM;
+                        unit_write_settingf(u, UNIT_RUNTIME, label, "%s=%s", dep_type_name, *dep);
+                }
         }
 
         return 0;
@@ -1337,6 +1513,7 @@ DEFINE_APPLY_EXEC_TRISTATE_BOOL(ignore_sigpipe,            "IgnoreSIGPIPE");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(lock_personality,          "LockPersonality");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(memory_deny_write_execute, "MemoryDenyWriteExecute");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(no_new_privileges,         "NoNewPrivileges");
+DEFINE_APPLY_EXEC_TRISTATE_BOOL(private_network,           "PrivateNetwork");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(remove_ipc,                "RemoveIPC");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(restrict_realtime,         "RestrictRealtime");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(restrict_suid_sgid,        "RestrictSUIDSGID");
@@ -1452,6 +1629,51 @@ static int apply_exec_root_hash_sig_path(Unit *u, ExecContext *c, TransientExecC
         return 0;
 }
 
+/* The IDL enums use the Varlink spelling ("read_only"), while the *_from_string() parsers
+ * expect the unit-file spelling ("read-only"); JSON_DISPATCH_ENUM_DEFINE bridges that by
+ * retrying with dashes on a miss. */
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_protect_system, ProtectSystem, protect_system_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_protect_home, ProtectHome, protect_home_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_private_tmp, PrivateTmp, private_tmp_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_private_users, PrivateUsers, private_users_from_string);
+
+/* For the sandbox knobs typed as yes/no strings in the IDL (PrivateNetwork), matching
+ * JSON_BUILD_PAIR_YES_NO on the runtime-context side, so a JSON boolean is not valid here. */
+static int dispatch_transient_yes_no_string(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        int *b = ASSERT_PTR(userdata);
+        int r;
+
+        assert(variant);
+
+        if (sd_json_variant_is_null(variant)) {
+                *b = -1;
+                return 0;
+        }
+
+        if (!sd_json_variant_is_string(variant))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL),
+                                "JSON field '%s' is not a string.", strna(name));
+
+        r = parse_boolean(sd_json_variant_string(variant));
+        if (r < 0)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL),
+                                "Value of JSON field '%s' is not a boolean string: %s",
+                                strna(name), sd_json_variant_string(variant));
+
+        *b = r;
+        return 0;
+}
+
+/* The sandbox enums accept every value their parser accepts, as over D-Bus. */
+static bool exec_enum_refuse_nothing(int value) {
+        return false;
+}
+
+DEFINE_APPLY_EXEC_ENUM(protect_system, "ProtectSystem", protect_system_to_string, exec_enum_refuse_nothing);
+DEFINE_APPLY_EXEC_ENUM(protect_home,   "ProtectHome",   protect_home_to_string,   exec_enum_refuse_nothing);
+DEFINE_APPLY_EXEC_ENUM(private_tmp,    "PrivateTmp",    private_tmp_to_string,    exec_enum_refuse_nothing);
+DEFINE_APPLY_EXEC_ENUM(private_users,  "PrivateUsers",  private_users_to_string,  exec_enum_refuse_nothing);
+
 /* Per-property descriptor for fields of the Exec context.
  *
  *   json_name     - JSON key inside the Exec object (e.g. "Nice").
@@ -1509,6 +1731,12 @@ typedef struct TransientExecProperty {
         { json, "Exec." json, SD_JSON_VARIANT_STRING, dispatch_fn,                         \
           offsetof(TransientExecContextParameters, field), 0, apply_exec_##field, true }
 
+/* Yes/no-string property: a tristate bool whose IDL type is string, see
+ * dispatch_transient_yes_no_string(). */
+#define EXEC_PROPERTY_YES_NO_STRING(json, field)                                          \
+        { json, "Exec." json, SD_JSON_VARIANT_STRING, dispatch_transient_yes_no_string,   \
+          offsetof(TransientExecContextParameters, field), 0, apply_exec_##field, true }
+
 static const TransientExecProperty exec_properties[] = {
         EXEC_PROPERTY              ("WorkingDirectory",       SD_JSON_VARIANT_OBJECT,        dispatch_transient_working_directory,        0,                                                                       0,             apply_exec_working_directory),
         EXEC_PROPERTY_ABSOLUTE_PATH("RootDirectory",          root_directory),
@@ -1527,8 +1755,13 @@ static const TransientExecProperty exec_properties[] = {
         EXEC_PROPERTY              ("OOMScoreAdjust",         SD_JSON_VARIANT_INTEGER,       dispatch_transient_oom_score_adjust,         0,                                                                       0,             apply_exec_oom_score_adjust),
         EXEC_PROPERTY_TRISTATE_BOOL("IgnoreSIGPIPE",          ignore_sigpipe),
         EXEC_PROPERTY              ("Nice",                   SD_JSON_VARIANT_INTEGER,       dispatch_transient_nice,                     0,                                                                       0,             apply_exec_nice),
+        EXEC_PROPERTY_ENUM         ("ProtectSystem",          protect_system, dispatch_protect_system),
+        EXEC_PROPERTY_ENUM         ("ProtectHome",            protect_home,   dispatch_protect_home),
+        EXEC_PROPERTY_ENUM         ("PrivateTmp",             private_tmp,    dispatch_private_tmp),
+        EXEC_PROPERTY_YES_NO_STRING("PrivateNetwork",         private_network),
         EXEC_PROPERTY_ABSOLUTE_PATH("NetworkNamespacePath",   network_namespace_path),
         EXEC_PROPERTY_ABSOLUTE_PATH("IPCNamespacePath",       ipc_namespace_path),
+        EXEC_PROPERTY_ENUM         ("PrivateUsers",           private_users,  dispatch_private_users),
         EXEC_PROPERTY_ABSOLUTE_PATH("UserNamespacePath",      user_namespace_path),
         EXEC_PROPERTY_TRISTATE_BOOL("LockPersonality",        lock_personality),
         EXEC_PROPERTY_TRISTATE_BOOL("MemoryDenyWriteExecute", memory_deny_write_execute),
@@ -1548,6 +1781,7 @@ static const TransientExecProperty exec_properties[] = {
 #undef EXEC_PROPERTY_STRING
 #undef EXEC_PROPERTY_ABSOLUTE_PATH
 #undef EXEC_PROPERTY_ENUM
+#undef EXEC_PROPERTY_YES_NO_STRING
 
 /* Tristate-bool and enum fields default to -1 (= absent). Default-zeroed slots would look
  * "explicitly set" to the apply path. Initialize all tristate fields here so adding a new such property only
@@ -1561,6 +1795,10 @@ static void transient_exec_context_parameters_init(TransientExecContextParameter
          * wide (their dispatchers write them through their own type) */
         assert_cc(sizeof(ExecInput) == sizeof(int));
         assert_cc(sizeof(ExecOutput) == sizeof(int));
+        assert_cc(sizeof(ProtectSystem) == sizeof(int));
+        assert_cc(sizeof(ProtectHome) == sizeof(int));
+        assert_cc(sizeof(PrivateTmp) == sizeof(int));
+        assert_cc(sizeof(PrivateUsers) == sizeof(int));
 
         FOREACH_ELEMENT(prop, exec_properties)
                 if (prop->tristate)
@@ -1784,6 +2022,291 @@ static int transient_service_apply_properties(Service *s, TransientServiceParame
         return 0;
 }
 
+static int transient_scope_apply_pid(Scope *s, sd_json_variant *json, sd_varlink *link, sd_bus_error *reterr_bus_error) {
+        Unit *u = UNIT(ASSERT_PTR(s));
+        int r;
+
+        _cleanup_(pidref_done) PidRef json_pidref = PIDREF_NULL;
+        r = json_dispatch_pidref("Scope.PIDs", json, SD_JSON_STRICT|SD_JSON_RELAX, &json_pidref);
+        if (r < 0)
+                return sd_bus_error_set_errno(reterr_bus_error, r);
+
+        _cleanup_(pidref_done) PidRef peer_pidref = PIDREF_NULL;
+        PidRef *pidref;
+        if (pidref_is_automatic(&json_pidref)) {
+                r = varlink_get_peer_pidref(link, &peer_pidref);
+                if (r < 0)
+                        return r;
+
+                pidref = &peer_pidref;
+        } else
+                pidref = &json_pidref;
+
+        r = unit_pid_attachable(u, pidref, reterr_bus_error);
+        if (r < 0)
+                return r;
+
+        r = unit_watch_pidref(u, pidref, /* exclusive= */ false);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
+static int transient_scope_apply_properties(
+                Scope *s,
+                TransientScopeParameters *sp,
+                sd_varlink *link,
+                const char **reterr_field,
+                sd_bus_error *reterr_bus_error) {
+        Unit *u = UNIT(ASSERT_PTR(s));
+        int r;
+
+        assert(sp);
+
+        if (sp->oom_policy != _OOM_POLICY_INVALID) {
+                s->oom_policy = sp->oom_policy;
+                unit_write_settingf(u, UNIT_RUNTIME|UNIT_PRIVATE, "OOMPolicy", "OOMPolicy=%s", oom_policy_to_string(sp->oom_policy));
+        }
+
+        transient_unit_apply_usec(u, "RuntimeMaxUSec", &s->runtime_max_usec, UNIT_PRIVATE, &sp->runtime_max_usec);
+        transient_unit_apply_usec(u, "RuntimeRandomizedExtraUSec", &s->runtime_rand_extra_usec, UNIT_PRIVATE, &sp->runtime_rand_extra_usec);
+        transient_unit_apply_usec(u, "TimeoutStopUSec", &s->timeout_stop_usec, UNIT_PRIVATE, &sp->timeout_stop_usec);
+
+        sd_json_variant *json_pid = NULL;
+        r = -EINVAL; /* Scope.PIDs is required! */
+        JSON_VARIANT_ARRAY_FOREACH(json_pid, sp->pids) {
+                r = transient_scope_apply_pid(s, json_pid, link, reterr_bus_error);
+                if (r < 0)
+                        break;
+        }
+        if (r < 0) {
+                if (reterr_field)
+                        *reterr_field = "Scope.PIDs";
+                return r;
+        }
+
+        return 0;
+}
+
+static int varlink_reply_unit_job(sd_varlink *link, Unit *u, Job *j) {
+        assert(link);
+        assert(u);
+        assert(j);
+
+        return sd_varlink_replybo(
+                        link,
+                        SD_JSON_BUILD_PAIR_CALLBACK("context", unit_context_build_json, u),
+                        SD_JSON_BUILD_PAIR_CALLBACK("runtime", unit_runtime_build_json, u),
+                        SD_JSON_BUILD_PAIR_CALLBACK("job", job_build_json, j));
+}
+
+static int varlink_reply_or_watch_unit_job(
+                sd_varlink *link,
+                Unit *u,
+                Job *j,
+                bool notify_job_changes,
+                bool notify_unit_changes) {
+
+        assert(link);
+        assert(u);
+        assert(j);
+
+        /* Non-streaming, or fire-and-forget (no notification flags set): return full unit context
+         * and runtime, plus the job object so the caller can correlate with later state. */
+        if (!notify_job_changes && !notify_unit_changes)
+                return varlink_reply_unit_job(link, u, j);
+
+        /* Streaming: attach to the job for the final reply, and optionally to the unit for state change
+         * notifications. j->varlink owns the stream lifetime, u->varlink_unit_change is just a flag to
+         * also send unit state notifications along the way.
+         *
+         * Because jobs coalesce, a concurrent streaming request may map onto a job (or unit) that is
+         * already being watched by another connection. Only a single streaming subscriber is supported,
+         * so reject the second one instead of clobbering the first. */
+        /* TODO: support multiple watchers. */
+        if (j->varlink || (notify_unit_changes && u->varlink_unit_change))
+                return sd_varlink_error(link, VARLINK_ERROR_UNIT_ALREADY_BEING_WATCHED, NULL);
+
+        j->varlink = sd_varlink_ref(link);
+        j->varlink_notify_job_changes = notify_job_changes;
+        if (notify_unit_changes)
+                u->varlink_unit_change = sd_varlink_ref(link);
+
+        /* Send initial job state notification if requested. Unit state change notifications are not sent
+         * here; they will arrive via varlink_unit_send_change_signal() when the unit actually transitions,
+         * matching D-Bus PropertiesChanged behavior. */
+        if (notify_job_changes)
+                return sd_varlink_notifybo(
+                                link,
+                                SD_JSON_BUILD_PAIR_CALLBACK("job", job_build_json, j));
+
+        return 0;
+}
+
+typedef struct EnqueueJobParameters {
+        char **names;
+        JobType job_type;
+        JobMode mode;
+        int notify_job_changes;
+        int notify_unit_changes;
+} EnqueueJobParameters;
+
+static void enqueue_job_parameters_done(EnqueueJobParameters *p) {
+        assert(p);
+
+        strv_free(p->names);
+}
+
+static int dispatch_unit_names(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        _cleanup_strv_free_ char **l = NULL;
+        char ***ret = ASSERT_PTR(userdata);
+        int r;
+
+        r = sd_json_dispatch_strv(name, variant, flags, &l);
+        if (r < 0)
+                return r;
+
+        if (strv_isempty(l) && FLAGS_SET(flags, SD_JSON_MANDATORY))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL),
+                                "JSON field '%s' is mandatory, but is an empty array.", strna(name));
+
+        /* Match the EnqueueUnitJobMany() D-Bus limit. */
+        if (strv_length(l) > (size_t) MANAGER_MAX_NAMES / 2)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(E2BIG),
+                                "JSON field '%s' contains too many unit names.", strna(name));
+
+        STRV_FOREACH(i, l)
+                if (!unit_name_is_valid(*i, UNIT_NAME_PLAIN|UNIT_NAME_INSTANCE))
+                        return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL),
+                                        "JSON field '%s' contains an invalid unit name.", strna(name));
+
+        return strv_free_and_replace(*ret, l);
+}
+
+int vl_method_enqueue_unit_job(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "names",             SD_JSON_VARIANT_ARRAY,   dispatch_unit_names,       offsetof(EnqueueJobParameters, names),               SD_JSON_MANDATORY },
+                { "jobType",           SD_JSON_VARIANT_STRING,  dispatch_job_type,         offsetof(EnqueueJobParameters, job_type),            SD_JSON_MANDATORY },
+                { "mode",              SD_JSON_VARIANT_STRING,  dispatch_job_mode,         offsetof(EnqueueJobParameters, mode),                0                 },
+                { "notifyJobChanges",  SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate, offsetof(EnqueueJobParameters, notify_job_changes),  0                 },
+                { "notifyUnitChanges", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate, offsetof(EnqueueJobParameters, notify_unit_changes), 0                 },
+                {}
+        };
+
+        _cleanup_(enqueue_job_parameters_done) EnqueueJobParameters p = {
+                .job_type = _JOB_TYPE_INVALID,
+                .mode = JOB_REPLACE,
+                .notify_job_changes = -1,
+                .notify_unit_changes = -1,
+        };
+        _cleanup_(sd_bus_error_free) sd_bus_error bus_error = SD_BUS_ERROR_NULL;
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(link);
+        assert(parameters);
+
+        r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
+        if (r != 0)
+                return r;
+
+        size_t n = strv_length(p.names);
+        bool notify = p.notify_job_changes > 0 || p.notify_unit_changes > 0;
+
+        if ((n > 1 || notify) && !FLAGS_SET(flags, SD_VARLINK_METHOD_MORE))
+                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, NULL);
+
+        /* A notification stream currently tracks only one job and unit. */
+        if (n > 1 && notify)
+                return sd_varlink_error(link, SD_VARLINK_ERROR_OPERATION_NOT_SUPPORTED, NULL);
+
+        const char **details = n == 1 ?
+                (const char**) STRV_MAKE(
+                                "unit", p.names[0],
+                                "verb", job_type_to_string(p.job_type),
+                                "polkit.message", N_("Authentication is required to manage unit '$(unit)'."),
+                                "polkit.gettext_domain", GETTEXT_PACKAGE) :
+                (const char**) STRV_MAKE(
+                                "verb", job_type_to_string(p.job_type),
+                                "polkit.message", N_("Authentication is required to manage system services or other units."),
+                                "polkit.gettext_domain", GETTEXT_PACKAGE);
+
+        r = varlink_verify_polkit_async(
+                        link,
+                        manager->system_bus,
+                        "org.freedesktop.systemd1.manage-units",
+                        details,
+                        &manager->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        Unit *first = NULL;
+        STRV_FOREACH(name, p.names) {
+                Unit *u;
+
+                r = load_unit_and_check(link, manager, *name, &u);
+                if (r < 0)
+                        return r;
+
+                r = mac_selinux_unit_access_check_varlink(u, link, job_type_to_access_method(p.job_type));
+                if (r < 0)
+                        return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
+
+                /* Reject an occupied unit subscription before enqueuing jobs. */
+                if (p.notify_unit_changes > 0 && u->varlink_unit_change)
+                        return sd_varlink_error(link, VARLINK_ERROR_UNIT_ALREADY_BEING_WATCHED, NULL);
+
+                if (!first)
+                        first = u;
+        }
+
+        assert(first);
+
+        if (n == 1) {
+                Job *j;
+                r = varlink_unit_queue_job_one(first, p.job_type, p.mode, /* reload_if_possible= */ false, /* ret_job_id= */ NULL, &j, &bus_error);
+                if (r < 0)
+                        return varlink_reply_bus_error(link, r, &bus_error);
+
+                return varlink_reply_or_watch_unit_job(link, first, j, p.notify_job_changes > 0, p.notify_unit_changes > 0);
+        }
+
+        /* Multiple units: enqueue all jobs in a single transaction */
+        _cleanup_set_free_ Set *jobs = set_new(NULL);
+        if (!jobs)
+                return -ENOMEM;
+
+        r = manager_add_jobs(
+                        manager,
+                        p.job_type,
+                        p.names,
+                        /* reload_if_possible= */ false,
+                        p.mode,
+                        /* extra_flags= */ 0,
+                        /* affected_jobs= */ NULL,
+                        &bus_error,
+                        jobs);
+        if (r < 0)
+                return varlink_reply_bus_error(link, r, &bus_error);
+
+        r = sd_varlink_set_sentinel(link, /* error_id= */ NULL);
+        if (r < 0)
+                return r;
+
+        Job *j;
+        SET_FOREACH(j, jobs) {
+                /* Before we send the method reply, force out the announcement JobNew for this job */
+                bus_job_send_pending_change_signal(j, /* including_new= */ true);
+
+                r = varlink_reply_unit_job(link, j->unit, j);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
 int vl_method_start_transient_unit(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         static const sd_json_dispatch_field dispatch_table[] = {
                 { "context",            SD_JSON_VARIANT_OBJECT,  dispatch_transient_context, 0,                                                       SD_JSON_MANDATORY },
@@ -1858,15 +2381,14 @@ int vl_method_start_transient_unit(sd_varlink *link, sd_json_variant *parameters
                 return varlink_reply_bus_error(link, r, &bus_error);
 
         /* Apply unit-level properties from context */
-        r = transient_unit_apply_properties(u, &p.context);
+        bad_field = NULL;
+        r = transient_unit_apply_properties(u, &p.context, &bad_field);
         if (r == -EINVAL)
-                return sd_varlink_error_invalid_parameter_name(link, "context");
+                return sd_varlink_error_invalid_parameter_name(link, bad_field ?: "context");
         if (r < 0)
                 return sd_varlink_error_errno(link, r);
 
-        /* Apply context.Exec only when an Exec object was actually sent. The tristate bool fields are
-         * seeded to -1 ("absent") during Exec dispatch; without an Exec object they stay 0, which the
-         * apply functions would misread as "explicitly false" and write out bogus FooBar=no lines. */
+        /* Apply context.Exec only when an Exec object was actually sent */
         if (p.context.exec.present) {
                 ExecContext *c = unit_get_exec_context(u);
                 if (!c)
@@ -1892,16 +2414,41 @@ int vl_method_start_transient_unit(sd_varlink *link, sd_json_variant *parameters
                         return sd_varlink_error_errno(link, r);
         }
 
-        /* Apply service-specific properties from context.Service */
-        Service *s = SERVICE(u);
-        if (s) {
+        /* Apply cgroup properties from context.CGroup */
+        if (p.context.cgroup.present) {
+                CGroupContext *cc = unit_get_cgroup_context(u);
+                if (!cc)
+                        return sd_varlink_error(link, VARLINK_ERROR_UNIT_TYPE_NOT_SUPPORTED, NULL);
+
                 bad_field = NULL;
-                r = transient_service_apply_properties(s, &p.context.service, &bad_field);
+                r = transient_cgroup_context_apply_properties(u, cc, &p.context.cgroup, &bad_field);
+                if (r == -EINVAL)
+                        return sd_varlink_error_invalid_parameter_name(link, bad_field ?: "CGroup");
+                if (r < 0)
+                        return sd_varlink_error_errno(link, r);
+        }
+
+        /* Apply service-specific properties from context.Service */
+        Service *service = SERVICE(u);
+        if (service) {
+                bad_field = NULL;
+                r = transient_service_apply_properties(service, &p.context.service, &bad_field);
                 if (r == -EINVAL)
                         return sd_varlink_error_invalid_parameter_name(link, bad_field ?: "Service");
                 if (r < 0)
                         return sd_varlink_error_errno(link, r);
         } else if (p.context.service.present)
+                return sd_varlink_error(link, VARLINK_ERROR_UNIT_TYPE_NOT_SUPPORTED, NULL);
+
+        Scope *scope = SCOPE(u);
+        if (scope) {
+                bad_field = NULL;
+                r = transient_scope_apply_properties(scope, &p.context.scope, link, &bad_field, &bus_error);
+                if (r == -EINVAL)
+                        return sd_varlink_error_invalid_parameter_name(link, bad_field ?: "Scope");
+                if (r < 0)
+                        return varlink_reply_bus_error(link, r, &bus_error);
+        } else if (p.context.scope.present)
                 return sd_varlink_error(link, VARLINK_ERROR_UNIT_TYPE_NOT_SUPPORTED, NULL);
 
         unit_add_to_load_queue(u);
@@ -1924,38 +2471,12 @@ int vl_method_start_transient_unit(sd_varlink *link, sd_json_variant *parameters
         if (r < 0)
                 return varlink_reply_bus_error(link, r, &bus_error);
 
-        bool notify_job = p.notify_job_changes > 0;
-        bool notify_unit = p.notify_unit_changes > 0;
+        bool more = FLAGS_SET(flags, SD_VARLINK_METHOD_MORE);
 
-        /* Non-streaming, or fire-and-forget (no notification flags set): return full unit context
-         * and runtime, plus the job object so the caller can correlate with later state. */
-        if (!FLAGS_SET(flags, SD_VARLINK_METHOD_MORE) || (!notify_job && !notify_unit))
-                return sd_varlink_replybo(
-                                link,
-                                SD_JSON_BUILD_PAIR_CALLBACK("context", unit_context_build_json, u),
-                                SD_JSON_BUILD_PAIR_CALLBACK("runtime", unit_runtime_build_json, u),
-                                SD_JSON_BUILD_PAIR_CALLBACK("job", job_build_json, j));
-
-        /* Streaming: always attach to the job for the final reply, and optionally to the unit for state
-         * change notifications. j->varlink owns the stream lifetime, u->varlink_unit_change is just a flag
-         * to also send unit state notifications along the way. */
-        assert(!j->varlink);
-        j->varlink = sd_varlink_ref(link);
-        j->varlink_notify_job_changes = notify_job;
-        if (notify_unit) {
-                assert(!u->varlink_unit_change);
-                u->varlink_unit_change = sd_varlink_ref(link);
-        }
-
-        /* Send initial job state notification if requested. Unit state change notifications are not sent
-         * here; they will arrive via varlink_unit_send_change_signal() when the unit actually transitions,
-         * matching D-Bus PropertiesChanged behavior. */
-        if (notify_job)
-                return sd_varlink_notifybo(
-                                link,
-                                SD_JSON_BUILD_PAIR_CALLBACK("job", job_build_json, j));
-
-        return 0;
+        return varlink_reply_or_watch_unit_job(
+                        link, u, j,
+                        more && p.notify_job_changes > 0,
+                        more && p.notify_unit_changes > 0);
 }
 
 typedef struct UnitSetPropertiesParameters {

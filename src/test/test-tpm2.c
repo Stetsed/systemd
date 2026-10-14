@@ -5,6 +5,7 @@
 #include "crypto-util.h"
 #include "hexdecoct.h"
 #include "iovec-util.h"
+#include "memory-util.h"
 #include "random-util.h"
 #include "tests.h"
 #include "tpm2-util.h"
@@ -515,6 +516,109 @@ static void digest_init(TPM2B_DIGEST *digest, const char *hash) {
         assert_se(digest_check(digest, hash));
 }
 
+static void check_digests(
+                const TPM2B_DIGEST *digests,
+                size_t n_digests,
+                const TPM2B_DIGEST *expect,
+                size_t n_expect) {
+
+        ASSERT_EQ(n_digests, n_expect);
+
+        for (size_t i = 0; i < n_expect; i++)
+                ASSERT_EQ(memcmp_nn(digests[i].buffer, digests[i].size, expect[i].buffer, expect[i].size), 0);
+}
+
+TEST(pcr_values_to_digests_for_selection) {
+        TPM2B_DIGEST s256[3], s1[2], empty = {};
+
+        digest_init(&s256[0], "2124793cbbe60c3a8637d3b84a5d054e87c351e1469a285acc04755e8b204dec");
+        digest_init(&s256[1], "bf7592f18adcfdc549fc0b94939f5069a24697f9cff4a0dca29014767b97559d");
+        digest_init(&s256[2], "4b00cff9dee3a364979b2dc241b34568a8ad49fcf2713df259e47dff8875feed");
+        digest_init(&s1[0], "f013d66c7f6817d08b7eb2a93e6d0440c1f3e7f8");
+        digest_init(&s1[1], "3d458cfe55cc03ea1f443f1562beec8df51c75e1");
+
+        _cleanup_free_ TPM2B_DIGEST *values = NULL;
+        size_t n_values;
+        TPML_PCR_SELECTION sel;
+
+        /* The supplied PCR values may be in any order; the result is ordered by the selection, ie. by
+         * ascending PCR index within each bank. */
+        tpm2_tpml_pcr_selection_from_mask(0x000092, TPM2_ALG_SHA256, &sel); /* PCR 1+4+7 */
+        const Tpm2PCRValue v1[] = {
+                TPM2_PCR_VALUE_MAKE(7, TPM2_ALG_SHA256, s256[2]),
+                TPM2_PCR_VALUE_MAKE(1, TPM2_ALG_SHA256, s256[0]),
+                TPM2_PCR_VALUE_MAKE(4, TPM2_ALG_SHA256, s256[1]),
+        };
+        const TPM2B_DIGEST e1[] = { s256[0], s256[1], s256[2], };
+        ASSERT_OK_ZERO(tpm2_pcr_values_to_digests_for_selection(&sel, v1, ELEMENTSOF(v1), &values, &n_values));
+        check_digests(values, n_values, e1, ELEMENTSOF(e1));
+        values = mfree(values);
+
+        /* Banks are digested in the order they appear in the selection, which need not be ascending by
+         * algorithm id - note sha256 (0x000b) is selected before sha1 (0x0004) here. */
+        tpm2_tpml_pcr_selection_from_mask(0x000012, TPM2_ALG_SHA256, &sel); /* PCR 1+4 */
+        tpm2_tpml_pcr_selection_add_mask(&sel, TPM2_ALG_SHA1, 0x000180);    /* PCR 7+8 */
+        const Tpm2PCRValue v2[] = {
+                TPM2_PCR_VALUE_MAKE(8, TPM2_ALG_SHA1,   s1[1]),
+                TPM2_PCR_VALUE_MAKE(4, TPM2_ALG_SHA256, s256[1]),
+                TPM2_PCR_VALUE_MAKE(7, TPM2_ALG_SHA1,   s1[0]),
+                TPM2_PCR_VALUE_MAKE(1, TPM2_ALG_SHA256, s256[0]),
+        };
+        const TPM2B_DIGEST e2[] = { s256[0], s256[1], s1[0], s1[1], };
+        ASSERT_OK_ZERO(tpm2_pcr_values_to_digests_for_selection(&sel, v2, ELEMENTSOF(v2), &values, &n_values));
+        check_digests(values, n_values, e2, ELEMENTSOF(e2));
+        values = mfree(values);
+
+        /* Values for PCRs that aren't selected are ignored. */
+        const Tpm2PCRValue v3[] = {
+                TPM2_PCR_VALUE_MAKE(8, TPM2_ALG_SHA1,   s1[1]),
+                TPM2_PCR_VALUE_MAKE(4, TPM2_ALG_SHA256, s256[1]),
+                TPM2_PCR_VALUE_MAKE(9, TPM2_ALG_SHA256, s256[2]), /* not selected */
+                TPM2_PCR_VALUE_MAKE(7, TPM2_ALG_SHA1,   s1[0]),
+                TPM2_PCR_VALUE_MAKE(4, TPM2_ALG_SHA1,   s1[1]),   /* selected in the other bank only */
+                TPM2_PCR_VALUE_MAKE(1, TPM2_ALG_SHA256, s256[0]),
+        };
+        ASSERT_OK_ZERO(tpm2_pcr_values_to_digests_for_selection(&sel, v3, ELEMENTSOF(v3), &values, &n_values));
+        check_digests(values, n_values, e2, ELEMENTSOF(e2));
+        values = mfree(values);
+
+        /* Every selected PCR must have a value though. */
+        const Tpm2PCRValue v4[] = {
+                TPM2_PCR_VALUE_MAKE(8, TPM2_ALG_SHA1,   s1[1]),
+                TPM2_PCR_VALUE_MAKE(4, TPM2_ALG_SHA256, s256[1]),
+                TPM2_PCR_VALUE_MAKE(1, TPM2_ALG_SHA256, s256[0]),
+        };
+        ASSERT_ERROR(tpm2_pcr_values_to_digests_for_selection(&sel, v4, ELEMENTSOF(v4), &values, &n_values), ENOENT);
+        ASSERT_NULL(values);
+        ASSERT_ERROR(tpm2_pcr_values_to_digests_for_selection(&sel, NULL, 0, &values, &n_values), ENOENT);
+        ASSERT_NULL(values);
+
+        /* A value whose size doesn't match its bank, or which has no value at all, is rejected. */
+        const Tpm2PCRValue v5[] = {
+                TPM2_PCR_VALUE_MAKE(8, TPM2_ALG_SHA1,   s1[1]),
+                TPM2_PCR_VALUE_MAKE(4, TPM2_ALG_SHA256, s1[0]),   /* sha1-sized value in the sha256 bank */
+                TPM2_PCR_VALUE_MAKE(7, TPM2_ALG_SHA1,   s1[0]),
+                TPM2_PCR_VALUE_MAKE(1, TPM2_ALG_SHA256, s256[0]),
+        };
+        ASSERT_ERROR(tpm2_pcr_values_to_digests_for_selection(&sel, v5, ELEMENTSOF(v5), &values, &n_values), EINVAL);
+        ASSERT_NULL(values);
+
+        const Tpm2PCRValue v6[] = {
+                TPM2_PCR_VALUE_MAKE(8, TPM2_ALG_SHA1,   s1[1]),
+                TPM2_PCR_VALUE_MAKE(4, TPM2_ALG_SHA256, s256[1]),
+                TPM2_PCR_VALUE_MAKE(7, TPM2_ALG_SHA1,   s1[0]),
+                TPM2_PCR_VALUE_MAKE(1, TPM2_ALG_SHA256, empty),
+        };
+        ASSERT_ERROR(tpm2_pcr_values_to_digests_for_selection(&sel, v6, ELEMENTSOF(v6), &values, &n_values), EINVAL);
+        ASSERT_NULL(values);
+
+        /* An empty selection selects nothing. */
+        tpm2_tpml_pcr_selection_from_mask(0x000000, TPM2_ALG_SHA256, &sel);
+        ASSERT_OK_ZERO(tpm2_pcr_values_to_digests_for_selection(&sel, v1, ELEMENTSOF(v1), &values, &n_values));
+        ASSERT_EQ(n_values, (size_t) 0);
+        ASSERT_NULL(values);
+}
+
 TEST(digest_many) {
         TPM2B_DIGEST d, d0, d1, d2, d3, d4;
 
@@ -526,53 +630,57 @@ TEST(digest_many) {
 
         /* tpm2_digest_init, tpm2_digest_rehash */
         d = (TPM2B_DIGEST){ .size = 1, .buffer = { 2, }, };
-        assert_se(tpm2_digest_init(TPM2_ALG_SHA256, &d) == 0);
-        assert_se(digest_check(&d, "0000000000000000000000000000000000000000000000000000000000000000"));
-        assert_se(tpm2_digest_rehash(TPM2_ALG_SHA256, &d) == 0);
-        assert_se(digest_check(&d, "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"));
+        ASSERT_OK_ZERO(tpm2_digest_init(TPM2_ALG_SHA256, &d));
+        ASSERT_TRUE(digest_check(&d, "0000000000000000000000000000000000000000000000000000000000000000"));
+        ASSERT_OK_ZERO(tpm2_digest_rehash(TPM2_ALG_SHA256, &d));
+        ASSERT_TRUE(digest_check(&d, "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"));
 
         d = d1;
-        assert_se(tpm2_digest_rehash(TPM2_ALG_SHA256, &d) == 0);
-        assert_se(digest_check(&d, "ab55014b5ace12ba70c3acc887db571585a83539aad3633d252a710f268f405c"));
-        assert_se(tpm2_digest_init(TPM2_ALG_SHA256, &d) == 0);
-        assert_se(digest_check(&d, "0000000000000000000000000000000000000000000000000000000000000000"));
+        ASSERT_OK_ZERO(tpm2_digest_rehash(TPM2_ALG_SHA256, &d));
+        ASSERT_TRUE(digest_check(&d, "ab55014b5ace12ba70c3acc887db571585a83539aad3633d252a710f268f405c"));
+        ASSERT_OK_ZERO(tpm2_digest_init(TPM2_ALG_SHA256, &d));
+        ASSERT_TRUE(digest_check(&d, "0000000000000000000000000000000000000000000000000000000000000000"));
 
         /* tpm2_digest_many_digests */
-        assert_se(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, &d2, 1, false) == 0);
-        assert_se(digest_check(&d, "56571a1be3fbeab18d215f549095915a004b5788ca0d535be668559129a76f25"));
-        assert_se(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, &d2, 1, true) == 0);
-        assert_se(digest_check(&d, "99dedaee8f4d8d10a8be184399fde8740d5e17ff783ee5c288a4486e4ce3a1fe"));
+        ASSERT_OK_ZERO(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, &d2, 1, false));
+        ASSERT_TRUE(digest_check(&d, "56571a1be3fbeab18d215f549095915a004b5788ca0d535be668559129a76f25"));
+        ASSERT_OK_ZERO(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, &d2, 1, true));
+        ASSERT_TRUE(digest_check(&d, "99dedaee8f4d8d10a8be184399fde8740d5e17ff783ee5c288a4486e4ce3a1fe"));
 
         const TPM2B_DIGEST da1[] = { d2, d3, };
-        assert_se(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da1, ELEMENTSOF(da1), false) == 0);
-        assert_se(digest_check(&d, "525aa13ef9a61827778ec3acf16fbb23b65ae8770b8fb2684d3a33f9457dd6d8"));
-        assert_se(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da1, ELEMENTSOF(da1), true) == 0);
-        assert_se(digest_check(&d, "399ca2aa98963d1bd81a2b58a7e5cda24bba1be88fb4da9aa73d97706846566b"));
+        ASSERT_OK_ZERO(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da1, ELEMENTSOF(da1), false));
+        ASSERT_TRUE(digest_check(&d, "525aa13ef9a61827778ec3acf16fbb23b65ae8770b8fb2684d3a33f9457dd6d8"));
+        ASSERT_OK_ZERO(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da1, ELEMENTSOF(da1), true));
+        ASSERT_TRUE(digest_check(&d, "399ca2aa98963d1bd81a2b58a7e5cda24bba1be88fb4da9aa73d97706846566b"));
 
         const TPM2B_DIGEST da2[] = { d3, d2, d0 };
-        assert_se(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da2, ELEMENTSOF(da2), false) == 0);
-        assert_se(digest_check(&d, "b26fd22db74d4cd896bff01c61aa498a575e4a553a7fb5a322a5fee36954313e"));
-        assert_se(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da2, ELEMENTSOF(da2), true) == 0);
-        assert_se(digest_check(&d, "091e79a5b09d4048df49a680f966f3ff67910afe185c3baf9704c9ca45bcf259"));
+        ASSERT_OK_ZERO(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da2, ELEMENTSOF(da2), false));
+        ASSERT_TRUE(digest_check(&d, "b26fd22db74d4cd896bff01c61aa498a575e4a553a7fb5a322a5fee36954313e"));
+        ASSERT_OK_ZERO(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da2, ELEMENTSOF(da2), true));
+        ASSERT_TRUE(digest_check(&d, "091e79a5b09d4048df49a680f966f3ff67910afe185c3baf9704c9ca45bcf259"));
 
         const TPM2B_DIGEST da3[] = { d4, d4, d4, d4, d3, d4, d4, d4, d4, };
-        assert_se(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da3, ELEMENTSOF(da3), false) == 0);
-        assert_se(digest_check(&d, "8eca947641b6002df79dfb571a7f78b7d0a61370a366f722386dfbe444d18830"));
-        assert_se(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da3, ELEMENTSOF(da3), true) == 0);
-        assert_se(digest_check(&d, "f9ba17bc0bbe8794e9bcbf112e4d59a11eb68fffbcd5516a746e4857829dff04"));
+        ASSERT_OK_ZERO(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da3, ELEMENTSOF(da3), false));
+        ASSERT_TRUE(digest_check(&d, "8eca947641b6002df79dfb571a7f78b7d0a61370a366f722386dfbe444d18830"));
+        ASSERT_OK_ZERO(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, da3, ELEMENTSOF(da3), true));
+        ASSERT_TRUE(digest_check(&d, "f9ba17bc0bbe8794e9bcbf112e4d59a11eb68fffbcd5516a746e4857829dff04"));
+
+        /* tpm2_digest_many_digests should digest an empty buffer when supplied 0 digests. */
+        ASSERT_OK_ZERO(tpm2_digest_many_digests(TPM2_ALG_SHA256, &d, NULL, 0, false));
+        ASSERT_TRUE(digest_check(&d, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
 
         /* tpm2_digest_buffer */
         const uint8_t b1[] = { 1, 2, 3, 4, };
-        assert_se(tpm2_digest_buffer(TPM2_ALG_SHA256, &d, b1, ELEMENTSOF(b1), false) == 0);
-        assert_se(digest_check(&d, "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a"));
-        assert_se(tpm2_digest_buffer(TPM2_ALG_SHA256, &d, b1, ELEMENTSOF(b1), true) == 0);
-        assert_se(digest_check(&d, "ff3bd307b287e9b29bb572f6ccfd19deb0106d0c4c3c5cfe8a1d03a396092ed4"));
+        ASSERT_OK_ZERO(tpm2_digest_buffer(TPM2_ALG_SHA256, &d, b1, ELEMENTSOF(b1), false));
+        ASSERT_TRUE(digest_check(&d, "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a"));
+        ASSERT_OK_ZERO(tpm2_digest_buffer(TPM2_ALG_SHA256, &d, b1, ELEMENTSOF(b1), true));
+        ASSERT_TRUE(digest_check(&d, "ff3bd307b287e9b29bb572f6ccfd19deb0106d0c4c3c5cfe8a1d03a396092ed4"));
 
         const void *b2 = d2.buffer;
-        assert_se(tpm2_digest_buffer(TPM2_ALG_SHA256, &d, b2, d2.size, false) == 0);
-        assert_se(digest_check(&d, "56571a1be3fbeab18d215f549095915a004b5788ca0d535be668559129a76f25"));
-        assert_se(tpm2_digest_buffer(TPM2_ALG_SHA256, &d, b2, d2.size, true) == 0);
-        assert_se(digest_check(&d, "99dedaee8f4d8d10a8be184399fde8740d5e17ff783ee5c288a4486e4ce3a1fe"));
+        ASSERT_OK_ZERO(tpm2_digest_buffer(TPM2_ALG_SHA256, &d, b2, d2.size, false));
+        ASSERT_TRUE(digest_check(&d, "56571a1be3fbeab18d215f549095915a004b5788ca0d535be668559129a76f25"));
+        ASSERT_OK_ZERO(tpm2_digest_buffer(TPM2_ALG_SHA256, &d, b2, d2.size, true));
+        ASSERT_TRUE(digest_check(&d, "99dedaee8f4d8d10a8be184399fde8740d5e17ff783ee5c288a4486e4ce3a1fe"));
 
         /* tpm2_digest_many */
         const struct iovec iov1[] = {
@@ -580,10 +688,28 @@ TEST(digest_many) {
                 IOVEC_MAKE(d2.buffer, d2.size),
                 IOVEC_MAKE(d3.buffer, d3.size),
         };
-        assert_se(tpm2_digest_many(TPM2_ALG_SHA256, &d, iov1, ELEMENTSOF(iov1), false) == 0);
-        assert_se(digest_check(&d, "cd7bde4a047af976b6f1b282309976229be59f96a78aa186de32a1aee488ab09"));
-        assert_se(tpm2_digest_many(TPM2_ALG_SHA256, &d, iov1, ELEMENTSOF(iov1), true) == 0);
-        assert_se(digest_check(&d, "02ecb0628264235111e0053e271092981c8b15d59cd46617836bee3149a4ecb0"));
+        ASSERT_OK_ZERO(tpm2_digest_many(TPM2_ALG_SHA256, &d, iov1, ELEMENTSOF(iov1), false));
+        ASSERT_TRUE(digest_check(&d, "cd7bde4a047af976b6f1b282309976229be59f96a78aa186de32a1aee488ab09"));
+        ASSERT_OK_ZERO(tpm2_digest_many(TPM2_ALG_SHA256, &d, iov1, ELEMENTSOF(iov1), true));
+        ASSERT_TRUE(digest_check(&d, "02ecb0628264235111e0053e271092981c8b15d59cd46617836bee3149a4ecb0"));
+
+#if HAVE_OPENSSL
+        /* Hash algorithms other than SHA256 */
+        ASSERT_OK_ZERO(tpm2_digest_init(TPM2_ALG_SHA384, &d));
+        ASSERT_TRUE(digest_check(&d, "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"));
+        ASSERT_OK_ZERO(tpm2_digest_rehash(TPM2_ALG_SHA384, &d));
+        ASSERT_TRUE(digest_check(&d, "8f0d145c0368ad6b70be22e41c400eea91b971d96ba220fec9fae25a58dffdaaf72dbe8f6783d55128c9df4efaf6f8a7"));
+
+        ASSERT_OK_ZERO(tpm2_digest_buffer(TPM2_ALG_SHA384, &d, b1, ELEMENTSOF(b1), false));
+        ASSERT_TRUE(digest_check(&d, "5a667d62430a8c253ebae433333904dc6e1d41dcdc479704773159b905a3ad82d2bad7762d81a366cc46fbb2e2327f5c"));
+        ASSERT_OK_ZERO(tpm2_digest_buffer(TPM2_ALG_SHA384, &d, b1, ELEMENTSOF(b1), true));
+        ASSERT_TRUE(digest_check(&d, "6ddf876fedf072ed945ada4babd57e26aefefa6b36b093bead91ab229ab63b874e8cf691a8c83af869643ab52688e929"));
+
+        /* Extending requires the digest size to already match the algorithm */
+        ASSERT_ERROR(tpm2_digest_buffer(TPM2_ALG_SHA256, &d, b1, ELEMENTSOF(b1), true), EINVAL);
+#endif
+
+        ASSERT_ERROR(tpm2_digest_init(TPM2_ALG_NULL, &d), EOPNOTSUPP);
 }
 
 static void check_parse_pcr_argument(
@@ -1333,6 +1459,92 @@ static void check_supports_command(Tpm2Context *c) {
         assert_se(tpm2_supports_command(c, TPM2_CC_Create));
         assert_se(tpm2_supports_command(c, TPM2_CC_CreatePrimary));
         assert_se(tpm2_supports_command(c, TPM2_CC_Unseal));
+}
+
+static void check_get_capability_property(Tpm2Context *c) {
+        assert(c);
+
+        TEST_LOG_FUNC();
+
+        /* Fetch the whole group of fixed properties in one go, so that we have something to cross-check the
+         * individual properties we fetch below against. This doesn't use the tpm2_get_capability_property
+         * helper that we are testing. */
+        Tpm2VendorInfo vendor_info;
+        ASSERT_OK(tpm2_get_vendor_info(c, &vendor_info));
+
+        /* The TPM will tell us that there are more properties to report if there are any properties after
+         * the last one we ask for, even if we don't request it. */
+        uint32_t value;
+        ASSERT_OK_POSITIVE(tpm2_get_capability_property(c, /* audit_session= */ NULL, TPM2_PT_LEVEL, &value));
+        ASSERT_EQ(value, vendor_info.level);
+
+        ASSERT_OK_POSITIVE(tpm2_get_capability_property(c, /* audit_session= */ NULL, TPM2_PT_YEAR, &value));
+        ASSERT_EQ(value, vendor_info.year);
+
+        ASSERT_OK_POSITIVE(tpm2_get_capability_property(
+                        c, /* audit_session= */ NULL, TPM2_PT_FIRMWARE_VERSION_2, &value));
+        ASSERT_EQ(value, vendor_info.firmware_version2);
+
+        /* Request a property we know doesn't exist. */
+        ASSERT_ERROR(tpm2_get_capability_property(
+                        c, /* audit_session= */ NULL, TPM2_PT_FIXED + TPM2_PT_GROUP - 1, &value), ENOENT);
+
+        /* Fetching a property with an audit session must give the same result. */
+        _cleanup_(tpm2_handle_freep) Tpm2Handle *session = NULL;
+        ASSERT_OK(tpm2_make_exclusive_audit_session(c, TPM2_ALG_SHA256, &session));
+
+        uint32_t audited_value;
+        ASSERT_OK_POSITIVE(tpm2_get_capability_property(
+                        c, session, TPM2_PT_FIRMWARE_VERSION_2, &audited_value));
+        ASSERT_EQ(audited_value, vendor_info.firmware_version2);
+}
+
+static void check_get_capability_auth_policy(Tpm2Context *c) {
+        static const TPM2_HANDLE handles[] = {
+                TPM2_RH_OWNER,
+                TPM2_RH_LOCKOUT,
+                TPM2_RH_ENDORSEMENT,
+        };
+        TPMT_HA policies[ELEMENTSOF(handles)] = {};
+        TPMT_HA policy = {};
+        int r;
+
+        assert(c);
+
+        TEST_LOG_FUNC();
+
+        r = tpm2_get_capability_auth_policy(c, /* audit_session= */ NULL, handles[0], &policies[0]);
+        if (r == -ENXIO) {
+                /* TPMs older than v1.38 don't support TPM_CAP_AUTH_POLICIES. */
+                log_notice("TPM does not support TPM_CAP_AUTH_POLICIES, skipping remaining tests.");
+                return;
+        }
+        ASSERT_OK(r);
+
+        for (size_t i = 0; i < ELEMENTSOF(handles); i++) {
+                ASSERT_OK(tpm2_get_capability_auth_policy(
+                                c, /* audit_session= */ NULL, handles[i], &policies[i]));
+
+                /* A hierarchy without an authorization policy is reported with TPM2_ALG_NULL, otherwise the
+                 * policy hash must use a hash algorithm the TPM supports. */
+                if (policies[i].hashAlg != TPM2_ALG_NULL) {
+                        ASSERT_TRUE(tpm2_supports_alg(c, policies[i].hashAlg));
+                }
+        }
+
+        /* The TPM must not report an authorization policy for a reserved permanent handle. */
+        ASSERT_ERROR(tpm2_get_capability_auth_policy(
+                        c, /* audit_session= */ NULL, TPM2_RH_LAST, &policy), ENOENT);
+
+        /* Fetching the same policies through an audit session must give the same results. */
+        _cleanup_(tpm2_handle_freep) Tpm2Handle *session = NULL;
+        ASSERT_OK(tpm2_make_exclusive_audit_session(c, TPM2_ALG_SHA256, &session));
+
+        for (size_t i = 0; i < ELEMENTSOF(handles); i++) {
+                policy = (TPMT_HA) {};
+                ASSERT_OK(tpm2_get_capability_auth_policy(c, session, handles[i], &policy));
+                ASSERT_EQ(policy.hashAlg, policies[i].hashAlg);
+        }
 }
 
 static void check_get_or_create_srk(Tpm2Context *c) {
@@ -2186,6 +2398,155 @@ TEST(tpm2_tpms_nv_public_to_json) {
         ASSERT_STREQ(json, "{\"nvIndex\":30474754,\"nameAlg\":\"SHA256\",\"attributes\":738590792,\"authPolicy\":\"c0f52d0be7f6c1666d90a181a99a74b99c5e0bfd00bc52cc27ae0e66d89afcf5\",\"dataSize\":32}");
 }
 
+TEST(tpm2_pcr_value_to_json) {
+        DEFINE_HEX_PTR(digest1, "2124793cbbe60c3a8637d3b84a5d054e87c351e1469a285acc04755e8b204dec");
+
+        Tpm2PCRValue pcr_value1 = {
+                .index = 11,
+                .hash = TPM2_ALG_SHA256,
+                .value = TPM2B_DIGEST_MAKE(digest1, digest1_len),
+        };
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v1 = NULL;
+        ASSERT_OK(tpm2_pcr_value_to_json(&pcr_value1, &v1));
+
+        _cleanup_free_ char *json1 = NULL;
+        ASSERT_OK(sd_json_variant_format(v1, 0, &json1));
+        ASSERT_STREQ(json1, "{\"pcr\":11,\"hashAlg\":\"SHA256\",\"digest\":\"2124793cbbe60c3a8637d3b84a5d054e87c351e1469a285acc04755e8b204dec\"}");
+
+        DEFINE_HEX_PTR(digest2, "f013d66c7f6817d08b7eb2a93e6d0440c1f3e7f8");
+
+        Tpm2PCRValue pcr_value2 = {
+                .index = 0,
+                .hash = TPM2_ALG_SHA1,
+                .value = TPM2B_DIGEST_MAKE(digest2, digest2_len),
+        };
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v2 = NULL;
+        ASSERT_OK(tpm2_pcr_value_to_json(&pcr_value2, &v2));
+
+        _cleanup_free_ char *json2 = NULL;
+        ASSERT_OK(sd_json_variant_format(v2, 0, &json2));
+        ASSERT_STREQ(json2, "{\"pcr\":0,\"hashAlg\":\"SHA1\",\"digest\":\"f013d66c7f6817d08b7eb2a93e6d0440c1f3e7f8\"}");
+}
+
+TEST(tpm2_tpms_tagged_property_to_json) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v1 = NULL;
+        TPMS_TAGGED_PROPERTY prop1 = {
+                .property = TPM2_PT_PERMANENT,
+                .value = TPMA_PERMANENT_LOCKOUTAUTHSET,
+        };
+        ASSERT_OK(tpm2_tpms_tagged_property_to_json(&prop1, &v1));
+
+        _cleanup_free_ char *json1 = NULL;
+        ASSERT_OK(sd_json_variant_format(v1, 0, &json1));
+        ASSERT_STREQ(json1, "{\"property\":\"PERMANENT\",\"value\":4}");
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v2 = NULL;
+        TPMS_TAGGED_PROPERTY prop2 = {
+                .property = TPM2_PT_LOCKOUT_INTERVAL,
+                .value = 7200,
+        };
+        ASSERT_OK(tpm2_tpms_tagged_property_to_json(&prop2, &v2));
+
+        _cleanup_free_ char *json2 = NULL;
+        ASSERT_OK(sd_json_variant_format(v2, 0, &json2));
+        ASSERT_STREQ(json2, "{\"property\":\"LOCKOUT_INTERVAL\",\"value\":7200}");
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v3 = NULL;
+        TPMS_TAGGED_PROPERTY prop3 = {
+                .property = TPM2_PT_MAX_DIGEST,
+                .value = 48,
+        };
+        ASSERT_OK(tpm2_tpms_tagged_property_to_json(&prop3, &v3));
+
+        _cleanup_free_ char *json3 = NULL;
+        ASSERT_OK(sd_json_variant_format(v3, 0, &json3));
+        ASSERT_STREQ(json3, "{\"property\":288,\"value\":48}");
+}
+
+TEST(tpm2_tpms_tagged_policy_to_json) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v1 = NULL;
+        TPMS_TAGGED_POLICY policy1 = {
+                .handle = TPM2_RH_OWNER,
+                .policyHash = {
+                        .hashAlg = TPM2_ALG_NULL,
+                }
+        };
+
+        ASSERT_OK(tpm2_tpms_tagged_policy_to_json(&policy1, &v1));
+
+        _cleanup_free_ char *json1 = NULL;
+        ASSERT_OK(sd_json_variant_format(v1, 0, &json1));
+        ASSERT_STREQ(json1, "{\"handle\":1073741825,\"policyHash\":{\"hashAlg\":\"NULL\"}}");
+
+        const char policy_hex2[] = "39d64794bd1eba89098fc63aac282c2c4eedf1dee79e4f6b99ca3f57f87d7dfc";
+        DEFINE_HEX_PTR(policy_bytes2, policy_hex2);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v2 = NULL;
+        TPMS_TAGGED_POLICY policy2 = {
+                .handle = TPM2_RH_LOCKOUT,
+                .policyHash = {
+                        .hashAlg = TPM2_ALG_SHA256,
+                },
+        };
+        ASSERT_EQ(policy_bytes2_len, sizeof(policy2.policyHash.digest.sha256));
+        memcpy(&policy2.policyHash.digest.sha256, policy_bytes2, sizeof(policy2.policyHash.digest.sha256));
+
+        ASSERT_OK(tpm2_tpms_tagged_policy_to_json(&policy2, &v2));
+
+        _cleanup_free_ char *json2 = NULL;
+        ASSERT_OK(sd_json_variant_format(v2, 0, &json2));
+        _cleanup_free_ char *json2_expected = NULL;
+        ASSERT_OK(asprintf(&json2_expected, "{\"handle\":1073741834,\"policyHash\":{\"hashAlg\":\"SHA256\",\"digest\":\"%s\"}}", policy_hex2));
+        ASSERT_STREQ(json2, json2_expected);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v3 = NULL;
+        TPMS_TAGGED_POLICY policy3 = {
+                .handle = TPM2_RH_PLATFORM,
+                .policyHash = {
+                        .hashAlg = TPM2_ALG_NULL,
+                }
+        };
+
+        ASSERT_OK(tpm2_tpms_tagged_policy_to_json(&policy3, &v3));
+
+        _cleanup_free_ char *json3 = NULL;
+        ASSERT_OK(sd_json_variant_format(v3, 0, &json3));
+        ASSERT_STREQ(json3, "{\"handle\":1073741836,\"policyHash\":{\"hashAlg\":\"NULL\"}}");
+
+        const char policy_hex4[] = "0a6d20fef462389c789b36e42efb94f9f9fd4d0174f0c27e14beff33d1cbdafeef119433117124e77a89b64ec80112f6";
+        DEFINE_HEX_PTR(policy_bytes4, policy_hex4);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v4 = NULL;
+        TPMS_TAGGED_POLICY policy4 = {
+                .handle = TPM2_RH_ENDORSEMENT,
+                .policyHash = {
+                        .hashAlg = TPM2_ALG_SHA384,
+                },
+        };
+        ASSERT_EQ(policy_bytes4_len, sizeof(policy4.policyHash.digest.sha384));
+        memcpy(&policy4.policyHash.digest.sha384, policy_bytes4, sizeof(policy4.policyHash.digest.sha384));
+
+        ASSERT_OK(tpm2_tpms_tagged_policy_to_json(&policy4, &v4));
+
+        _cleanup_free_ char *json4 = NULL;
+        ASSERT_OK(sd_json_variant_format(v4, 0, &json4));
+        _cleanup_free_ char *json4_expected = NULL;
+        ASSERT_OK(asprintf(&json4_expected, "{\"handle\":1073741835,\"policyHash\":{\"hashAlg\":\"SHA384\",\"digest\":\"%s\"}}", policy_hex4));
+        ASSERT_STREQ(json4, json4_expected);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v5 = NULL;
+        TPMS_TAGGED_POLICY policy_unsupported = {
+                .handle = TPM2_RH_OWNER,
+                .policyHash = {
+                        .hashAlg = TPM2_ALG_SM3_256,
+                }
+        };
+
+        ASSERT_ERROR(tpm2_tpms_tagged_policy_to_json(&policy_unsupported, &v5), EINVAL);
+}
+
 static void check_attest_common(const TPMS_ATTEST *attest, TPMI_ST_ATTEST type, const TPM2B_DATA *extra_data) {
         ASSERT_EQ(attest->magic, TPM2_GENERATED_VALUE);
         ASSERT_EQ(attest->type, type);
@@ -2359,6 +2720,8 @@ TEST_RET(tests_which_require_tpm) {
         check_test_parms(c);
         check_supports_alg(c);
         check_supports_command(c);
+        check_get_capability_property(c);
+        check_get_capability_auth_policy(c);
         check_best_srk_template(c);
         check_get_or_create_srk(c);
         check_seal_unseal(c);

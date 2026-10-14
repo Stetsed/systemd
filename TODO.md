@@ -127,12 +127,19 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 ## Features
 
+- teach hostnamed to unset tags by wildcard
+
+- define portabled auto-attach dir where DDIs can be dropped that are
+  automatically attached after an explicit call to work on it
+
+- portabled attempt counters and automatic fallback with reattachment of
+  portable service
+
+- make vpick assessment counting work
+
 - sysext: condition confext/sysext on machine tags, too
 
 - sysupdate: add health check logic, revert updates if fail
-
-- sysupdate: run things in a loop always, to deal with stepping stones, and
-  adding new transfer files. finish, when stable.
 
 - sysupdate: add flag field for features and components, to require a restart
   of the update loop once they have been updated.
@@ -154,18 +161,13 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - acquire a TSA from time stamping server, include it in report
 
 - **report:**
-  - implement metrics provider in logind: report number of active
-    sessions, and number of sessions since boot.
-  - implement metrics provider in journald that reports number of log messages
-    received since boot, by log priority
   - allow to compile statically (together with the basic and cgroup
     backends)
   - make sure backends can also be invoked via forking off
   - allow metrics providers to indicate which reported values mean
     "nothing"/"invalid"/"zero"/"please-suppress". Then use that to reduce noise
     in systemd-report output.
-  - implement metrics provider that reports local IP addresses, and bound open
-    IP ports
+  - implement metrics provider that reports bound open IP ports
   - metrics from pid1: suppress metrics form units that are inactive and have nothing to report
   - pass filtering hints to services, so that they can also be applied server-side, not just client side
   - add "hint-suppress-zero" flag (which suppresses all metrics which are zero)
@@ -337,10 +339,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 - repart: add MatchLabel= which matches against partition label, so that we
   truly can install different images in parallel
-
-- add "systemctl wait" or so, which does what "systemd-run --wait" does, but
-  for all units. It should be both a way to pin units into memory as well as a
-  wait to retrieve their exit data.
 
 - add "systemd-analyze debug" + AttachDebugger= in unit files: The former
   specifies a command to execute; the latter specifies that an already running

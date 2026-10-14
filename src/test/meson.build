@@ -105,6 +105,7 @@ simple_tests += files(
         'test-execve.c',
         'test-exit-status.c',
         'test-extract-word.c',
+        'test-fanotify-util.c',
         'test-fdset.c',
         'test-fiemap.c',
         'test-fileio.c',
@@ -330,10 +331,7 @@ executables += [
                 'type' : 'manual',
         },
         test_template + {
-                'sources' : files(
-                        'test-dlopen-so.c',
-                        'gcrypt-util.c',
-                ),
+                'sources' : files('test-dlopen-so.c'),
                 'dependencies' : [
                         libacl_cflags,
                         libapparmor_cflags,
@@ -345,7 +343,6 @@ executables += [
                         libcurl_cflags,
                         libfdisk_cflags,
                         libfido2_cflags,
-                        libgcrypt_cflags,
                         libgnutls_cflags,
                         libidn2_cflags,
                         libkmod_cflags,
@@ -412,6 +409,9 @@ executables += [
         test_template + {
                 'sources' : files('test-ipcrm.c'),
                 'type' : 'unsafe',
+        },
+        test_template + {
+                'sources' : files('test-kernel-image.c'),
         },
         test_template + {
                 'sources' : files('test-kexec.c'),
