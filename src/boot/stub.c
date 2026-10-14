@@ -1072,20 +1072,34 @@ static void install_embedded_devicetree(
                         sections[section].memory_size);
         if (err != EFI_SUCCESS)
                 log_error_status(err, "Error loading embedded devicetree, ignoring: %m");
+}
 
-        #ifdef HAVE_LIBFDT
+static void install_embedded_devicetree_overlay(
+                EFI_LOADED_IMAGE_PROTOCOL *loaded_image,
+                const PeSectionVector sections[static _UNIFIED_SECTION_MAX],
+                struct devicetree_state *dt_state) {
+
+        EFI_STATUS err;
+
+        assert(loaded_image);
+        assert(sections);
+        assert(dt_state);
+
         if (!PE_SECTION_VECTOR_IS_SET(sections + UNIFIED_SECTION_DTBO))
                 return;
 
         err = devicetree_apply_overlay_memory(dt_state,
                                               (uint8_t*) loaded_image->ImageBase + sections[UNIFIED_SECTION_DTBO].memory_offset,
-                                              sections[section].memory_size);
+                                              sections[UNIFIED_SECTION_DTBO].memory_size);
 
         if (err != EFI_SUCCESS)
-                log_error_status(err, "Error loaded embedded devicetree overlay, ignoring: %m");
+                log_warning_status(err, "Error loading embedded devicetree overlay, ignoring: %m");
+                return;
 
-        devicetree_install(dt_state);
-        #endif
+        err = devicetree_install(dt_state);
+
+        if (err != EFI_SUCCESS)
+                log_error_status(err, "Error installing devicetree, ignoring: %m");
 }
 
 static void load_all_addons(
@@ -1343,10 +1357,9 @@ static EFI_STATUS run(EFI_HANDLE image) {
         /* First load the base device tree, then fix it up using addons - global first, then per-UKI, lastly
          * install overlays from addons if compiled with LIBFDT. */
         install_embedded_devicetree(loaded_image, sections, &dt_state);
+        install_embedded_devicetree_overlay(loaded_image, sections, &dt_state);
         install_addon_devicetrees(&dt_state, dt_addons, n_dt_addons, &parameters_measured);
-        #ifdef HAVE_LIBFDT
         install_addon_devicetree_overlays(&dt_state, dtbo_addons, n_dtbo_addons, &parameters_measured);
-        #endif
 
         /* Generate & find all initrds */
         acquire_previous_initrd(initrds);
